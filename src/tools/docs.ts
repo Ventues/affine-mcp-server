@@ -1585,34 +1585,32 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
             const rowsRaw = raw.get("prop:rows");
             const colsRaw = raw.get("prop:columns");
             const cellsRaw = raw.get("prop:cells");
-            if (rowsRaw && colsRaw && cellsRaw) {
-              const toObj = (v: unknown) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
-              const rowsObj = toObj(rowsRaw) as Record<string, { order?: string }>;
-              const colsObj = toObj(colsRaw) as Record<string, { order?: string }>;
-              const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
-              const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
-              if (sortedRowIds.length > 0 && sortedColIds.length > 0) {
-                const readCell = (rowId: string, colId: string): string => {
-                  const key = `${rowId}:${colId}`;
-                  if (cellsRaw instanceof Y.Map) {
-                    const cell = cellsRaw.get(key);
-                    if (cell instanceof Y.Map) return asText(cell.get("text"));
-                    if (cell instanceof Y.Text) return cell.toString();
-                  }
-                  const obj = toObj(cellsRaw) as Record<string, any>;
-                  const c = obj[key];
-                  if (c && typeof c === "object" && "text" in c) return String(c.text ?? "");
-                  return "";
-                };
-                for (let r = 0; r < sortedRowIds.length; r++) {
-                  const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
-                  lines.push(`| ${cells.join(" | ")} |`);
-                  if (r === 0) lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
+            const toObj = (v: unknown) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
+            const rowsObj = rowsRaw ? toObj(rowsRaw) as Record<string, { order?: string }> : {};
+            const colsObj = colsRaw ? toObj(colsRaw) as Record<string, { order?: string }> : {};
+            const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
+            const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
+            if (sortedRowIds.length > 0 && sortedColIds.length > 0 && cellsRaw) {
+              const readCell = (rowId: string, colId: string): string => {
+                const key = `${rowId}:${colId}`;
+                if (cellsRaw instanceof Y.Map) {
+                  const cell = cellsRaw.get(key);
+                  if (cell instanceof Y.Map) return asText(cell.get("text"));
+                  if (cell instanceof Y.Text) return cell.toString();
                 }
-                lines.push("");
-              } else {
-                lines.push("*(empty table)*", "");
+                const obj = toObj(cellsRaw) as Record<string, any>;
+                const c = obj[key];
+                if (c && typeof c === "object" && "text" in c) return String(c.text ?? "");
+                return "";
+              };
+              for (let r = 0; r < sortedRowIds.length; r++) {
+                const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
+                lines.push(`| ${cells.join(" | ")} |`);
+                if (r === 0) lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
               }
+              lines.push("");
+            } else {
+              lines.push("*(empty table)*", "");
             }
             break;
           }
@@ -1632,9 +1630,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
             break;
           }
           case "affine:database": {
-            const dbTitle = asText(raw.get("prop:title"));
+            const dbTitle = asText(raw.get("prop:title")) || blockText;
             if (dbTitle) lines.push(`${indent}**${dbTitle}**`, "");
             for (const cid of childIds) renderBlock(cid, depth, []);
+            if (!dbTitle && childIds.length === 0) lines.push("*(database)*", "");
             break;
           }
           case "affine:bookmark": {
