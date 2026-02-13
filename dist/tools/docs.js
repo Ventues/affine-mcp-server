@@ -2,6 +2,7 @@ import { z } from "zod";
 import { text } from "../util/mcp.js";
 import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, deleteDoc as wsDeleteDoc } from "../ws.js";
 import * as Y from "yjs";
+import MarkdownIt from "markdown-it";
 const WorkspaceId = z.string().min(1, "workspaceId required");
 const DocId = z.string().min(1, "docId required");
 const APPEND_BLOCK_CANONICAL_TYPE_VALUES = [
@@ -87,6 +88,41 @@ export function registerDocTools(server, gql, defaults) {
         if (typeof value === "string")
             return value;
         return "";
+    }
+    function richTextToMarkdown(value) {
+        if (typeof value === "string")
+            return value;
+        if (!(value instanceof Y.Text))
+            return "";
+        const delta = value.toDelta();
+        if (!delta || delta.length === 0)
+            return "";
+        // Fast path: no attributes anywhere → plain text
+        if (delta.every(d => !d.attributes))
+            return value.toString();
+        return delta.map(d => {
+            if (typeof d.insert !== "string")
+                return "";
+            let t = d.insert;
+            const a = d.attributes;
+            if (!a)
+                return t;
+            if (a.code)
+                return `\`${t}\``;
+            if (a.bold && a.italic)
+                t = `***${t}***`;
+            else if (a.bold)
+                t = `**${t}**`;
+            else if (a.italic)
+                t = `*${t}*`;
+            if (a.strikethrough)
+                t = `~~${t}~~`;
+            if (a.underline)
+                t = `<u>${t}</u>`;
+            if (a.link)
+                t = `[${t}](${a.link})`;
+            return t;
+        }).join("");
     }
     function childIdsFrom(value) {
         if (!(value instanceof Y.Array))
@@ -1329,7 +1365,7 @@ export function registerDocTools(server, gql, defaults) {
                     return;
                 const flavour = raw.get("sys:flavour");
                 const type = raw.get("prop:type");
-                const blockText = asText(raw.get("prop:text"));
+                const blockText = richTextToMarkdown(raw.get("prop:text"));
                 const childIds = childIdsFrom(raw.get("sys:children"));
                 const indent = "  ".repeat(depth);
                 switch (flavour) {
@@ -1399,9 +1435,9 @@ export function registerDocTools(server, gql, defaults) {
                                 if (cellsRaw instanceof Y.Map) {
                                     const cell = cellsRaw.get(key);
                                     if (cell instanceof Y.Map)
-                                        return asText(cell.get("text"));
+                                        return richTextToMarkdown(cell.get("text"));
                                     if (cell instanceof Y.Text)
-                                        return cell.toString();
+                                        return richTextToMarkdown(cell);
                                 }
                                 const obj = toObj(cellsRaw);
                                 const c = obj[key];
@@ -1513,6 +1549,445 @@ export function registerDocTools(server, gql, defaults) {
             docId: DocId,
         },
     }, readDocAsMarkdownHandler);
+    // ── write_doc_from_markdown ───────────────────────────────────────────
+    const mdParser = new MarkdownIt();
+    /** Convert markdown-it inline tokens to a Y.Text with rich formatting deltas */
+    function makeRichText(children) {
+        const yt = new Y.Text();
+        if (!children || children.length === 0)
+            return yt;
+        // Build segments with explicit attributes
+        const allKeys = new Set();
+        const segments = [];
+        const active = {};
+        for (const tok of children) {
+            switch (tok.type) {
+                case "text":
+                case "softbreak": {
+                    const t = tok.type === "softbreak" ? "\n" : tok.content;
+                    if (t)
+                        segments.push({ text: t, attrs: { ...active } });
+                    break;
+                }
+                case "code_inline":
+                    segments.push({ text: tok.content, attrs: { code: true } });
+                    allKeys.add("code");
+                    break;
+                case "strong_open":
+                    active.bold = true;
+                    allKeys.add("bold");
+                    break;
+                case "strong_close":
+                    delete active.bold;
+                    break;
+                case "em_open":
+                    active.italic = true;
+                    allKeys.add("italic");
+                    break;
+                case "em_close":
+                    delete active.italic;
+                    break;
+                case "s_open":
+                    active.strikethrough = true;
+                    allKeys.add("strikethrough");
+                    break;
+                case "s_close":
+                    delete active.strikethrough;
+                    break;
+                case "link_open": {
+                    const href = tok.attrs?.find(a => a[0] === "href")?.[1];
+                    if (href) {
+                        active.link = href;
+                        allKeys.add("link");
+                    }
+                    break;
+                }
+                case "link_close":
+                    delete active.link;
+                    break;
+                case "image": {
+                    const alt = tok.content || tok.children?.map(c => c.content).join("") || "";
+                    if (alt)
+                        segments.push({ text: alt, attrs: {} });
+                    break;
+                }
+                default:
+                    if (tok.content)
+                        segments.push({ text: tok.content, attrs: {} });
+                    break;
+            }
+        }
+        // Insert segments with explicit null for inactive attributes (prevents Y.Text inheritance)
+        let pos = 0;
+        const needsExplicitAttrs = allKeys.size > 0;
+        for (const seg of segments) {
+            if (!needsExplicitAttrs) {
+                yt.insert(pos, seg.text);
+            }
+            else {
+                const a = {};
+                for (const key of allKeys)
+                    a[key] = seg.attrs[key] ?? null;
+                yt.insert(pos, seg.text, a);
+            }
+            pos += seg.text.length;
+        }
+        return yt;
+    }
+    /** Walk markdown-it tokens and create AFFiNE blocks under the given parent */
+    function markdownToBlocks(tokens, noteId, blocks, noteChildren) {
+        let i = 0;
+        function addBlock(parentId, parentChildren, flavour, props) {
+            const blockId = generateId();
+            const block = new Y.Map();
+            setSysFields(block, blockId, flavour);
+            block.set("sys:parent", parentId);
+            const ch = new Y.Array();
+            block.set("sys:children", ch);
+            for (const [k, v] of Object.entries(props))
+                block.set(k, v);
+            blocks.set(blockId, block);
+            parentChildren.push([blockId]);
+            return { blockId, children: ch };
+        }
+        function getInlineToken(idx) {
+            return idx < tokens.length && tokens[idx].type === "inline" ? tokens[idx] : null;
+        }
+        function processListItems(parentId, parentChildren, listType) {
+            // We're positioned after the list_open token. Process list_item tokens until list_close.
+            while (i < tokens.length) {
+                const tok = tokens[i];
+                if (tok.type === "bullet_list_close" || tok.type === "ordered_list_close") {
+                    i++;
+                    return;
+                }
+                if (tok.type !== "list_item_open") {
+                    i++;
+                    continue;
+                }
+                i++; // skip list_item_open
+                // Next should be paragraph_open + inline + paragraph_close (the item text)
+                let itemInline = null;
+                if (i < tokens.length && tokens[i].type === "paragraph_open") {
+                    i++; // skip paragraph_open
+                    itemInline = getInlineToken(i);
+                    if (itemInline)
+                        i++;
+                    if (i < tokens.length && tokens[i].type === "paragraph_close")
+                        i++;
+                }
+                // Detect todo items: text starting with [ ] or [x]
+                let actualType = listType;
+                let checked = false;
+                let inlineChildren = itemInline?.children || null;
+                if (listType === "bulleted" && itemInline?.content) {
+                    const todoMatch = itemInline.content.match(/^\[([ xX])\]\s*/);
+                    if (todoMatch) {
+                        actualType = "todo";
+                        checked = todoMatch[1] !== " ";
+                        // Strip the [ ]/[x] prefix from the inline children
+                        if (inlineChildren && inlineChildren.length > 0 && inlineChildren[0].type === "text") {
+                            inlineChildren = [...inlineChildren];
+                            const first = { ...inlineChildren[0], content: inlineChildren[0].content.replace(/^\[([ xX])\]\s*/, "") };
+                            inlineChildren[0] = first;
+                        }
+                    }
+                }
+                const props = {
+                    "prop:type": actualType,
+                    "prop:text": makeRichText(inlineChildren),
+                    "prop:checked": actualType === "todo" ? checked : false,
+                };
+                const item = addBlock(parentId, parentChildren, "affine:list", props);
+                // Process nested lists (children of this list item)
+                while (i < tokens.length && tokens[i].type !== "list_item_close") {
+                    if (tokens[i].type === "bullet_list_open") {
+                        i++;
+                        processListItems(item.blockId, item.children, "bulleted");
+                    }
+                    else if (tokens[i].type === "ordered_list_open") {
+                        i++;
+                        processListItems(item.blockId, item.children, "numbered");
+                    }
+                    else {
+                        i++; // skip unexpected tokens inside list item
+                    }
+                }
+                if (i < tokens.length && tokens[i].type === "list_item_close")
+                    i++;
+            }
+        }
+        while (i < tokens.length) {
+            const tok = tokens[i];
+            // Heading
+            if (tok.type === "heading_open") {
+                const level = parseInt(tok.tag.replace("h", ""), 10) || 1;
+                i++;
+                const inline = getInlineToken(i);
+                if (inline)
+                    i++;
+                i++; // heading_close
+                addBlock(noteId, noteChildren, "affine:paragraph", {
+                    "prop:type": `h${level}`,
+                    "prop:text": makeRichText(inline?.children || null),
+                });
+                continue;
+            }
+            // Paragraph — may contain special AFFiNE blocks
+            if (tok.type === "paragraph_open") {
+                i++;
+                const inline = getInlineToken(i);
+                if (inline)
+                    i++;
+                i++; // paragraph_close
+                if (inline) {
+                    const content = inline.content;
+                    const children = inline.children || [];
+                    // Detect $$latex$$ block
+                    const latexMatch = content.match(/^\$\$([\s\S]+)\$\$$/);
+                    if (latexMatch) {
+                        addBlock(noteId, noteChildren, "affine:latex", {
+                            "prop:xywh": "[0,0,16,16]", "prop:index": "a0",
+                            "prop:lockedBySelf": false, "prop:scale": 1, "prop:rotate": 0,
+                            "prop:latex": latexMatch[1],
+                        });
+                        continue;
+                    }
+                    // Detect 📎 attachment
+                    const attachMatch = content.match(/^📎\s+(.+)$/);
+                    if (attachMatch) {
+                        addBlock(noteId, noteChildren, "affine:attachment", {
+                            "prop:name": attachMatch[1], "prop:type": "application/octet-stream",
+                            "prop:size": 0, "prop:sourceId": "", "prop:embed": false,
+                        });
+                        continue;
+                    }
+                    // Detect image: single image token
+                    if (children.length === 1 && children[0].type === "image") {
+                        const imgTok = children[0];
+                        const src = imgTok.attrs?.find(a => a[0] === "src")?.[1] || "";
+                        const caption = imgTok.content || imgTok.children?.map(c => c.content).join("") || "";
+                        addBlock(noteId, noteChildren, "affine:image", {
+                            "prop:sourceId": src === "image" ? "" : src,
+                            "prop:caption": caption, "prop:width": 0, "prop:height": 0,
+                            "prop:xywh": "[0,0,0,0]", "prop:index": "a0",
+                            "prop:lockedBySelf": false, "prop:rotate": 0,
+                        });
+                        continue;
+                    }
+                    // Detect affine:// linked doc: single link with affine:// href
+                    if (children.length === 3 && children[0].type === "link_open") {
+                        const href = children[0].attrs?.find(a => a[0] === "href")?.[1] || "";
+                        if (href.startsWith("affine://")) {
+                            const pageId = href.replace("affine://", "");
+                            const linkText = children[1]?.content || "Linked Doc";
+                            addBlock(noteId, noteChildren, "affine:embed-linked-doc", {
+                                "prop:pageId": pageId, "prop:title": linkText,
+                                "prop:xywh": "[0,0,0,0]", "prop:index": "a0",
+                                "prop:lockedBySelf": false, "prop:rotate": 0,
+                                "prop:style": "horizontal",
+                            });
+                            continue;
+                        }
+                    }
+                    // Regular paragraph
+                    addBlock(noteId, noteChildren, "affine:paragraph", {
+                        "prop:type": "text",
+                        "prop:text": makeRichText(children),
+                    });
+                }
+                continue;
+            }
+            // Blockquote
+            if (tok.type === "blockquote_open") {
+                i++;
+                // Collect inline content from the paragraph inside blockquote
+                if (i < tokens.length && tokens[i].type === "paragraph_open") {
+                    i++;
+                    const inline = getInlineToken(i);
+                    if (inline)
+                        i++;
+                    i++; // paragraph_close
+                    addBlock(noteId, noteChildren, "affine:paragraph", {
+                        "prop:type": "quote",
+                        "prop:text": makeRichText(inline?.children || null),
+                    });
+                }
+                // Skip to blockquote_close
+                while (i < tokens.length && tokens[i].type !== "blockquote_close")
+                    i++;
+                i++; // blockquote_close
+                continue;
+            }
+            // Bullet list
+            if (tok.type === "bullet_list_open") {
+                i++;
+                processListItems(noteId, noteChildren, "bulleted");
+                continue;
+            }
+            // Ordered list
+            if (tok.type === "ordered_list_open") {
+                i++;
+                processListItems(noteId, noteChildren, "numbered");
+                continue;
+            }
+            // Fenced code block
+            if (tok.type === "fence") {
+                addBlock(noteId, noteChildren, "affine:code", {
+                    "prop:language": tok.info.trim() || "txt",
+                    "prop:text": makeText(tok.content.replace(/\n$/, "")),
+                });
+                i++;
+                continue;
+            }
+            // Horizontal rule
+            if (tok.type === "hr") {
+                addBlock(noteId, noteChildren, "affine:divider", {});
+                i++;
+                continue;
+            }
+            // Table
+            if (tok.type === "table_open") {
+                i++;
+                // Collect all rows (thead + tbody)
+                const tableRows = []; // rows of cells, each cell is array of inline children
+                while (i < tokens.length && tokens[i].type !== "table_close") {
+                    if (tokens[i].type === "tr_open") {
+                        i++;
+                        const row = [];
+                        while (i < tokens.length && tokens[i].type !== "tr_close") {
+                            if (tokens[i].type === "th_open" || tokens[i].type === "td_open") {
+                                i++;
+                                const inline = getInlineToken(i);
+                                if (inline) {
+                                    row.push(inline.children || []);
+                                    i++;
+                                }
+                                else
+                                    row.push([]);
+                                i++; // th_close/td_close
+                            }
+                            else
+                                i++;
+                        }
+                        i++; // tr_close
+                        tableRows.push(row);
+                    }
+                    else
+                        i++;
+                }
+                i++; // table_close
+                const nRows = tableRows.length;
+                const nCols = nRows > 0 ? Math.max(...tableRows.map(r => r.length)) : 1;
+                // Build AFFiNE table block
+                const rowIds = [];
+                const colIds = [];
+                const rows = {};
+                const columns = {};
+                const cells = {};
+                for (let r = 0; r < nRows; r++) {
+                    const rid = generateId();
+                    rowIds.push(rid);
+                    rows[rid] = { rowId: rid, order: `r${String(r).padStart(4, "0")}` };
+                }
+                for (let c = 0; c < nCols; c++) {
+                    const cid = generateId();
+                    colIds.push(cid);
+                    columns[cid] = { columnId: cid, order: `c${String(c).padStart(4, "0")}` };
+                }
+                for (let r = 0; r < nRows; r++) {
+                    for (let c = 0; c < nCols; c++) {
+                        const cellChildren = tableRows[r]?.[c] || [];
+                        cells[`${rowIds[r]}:${colIds[c]}`] = { text: makeRichText(cellChildren) };
+                    }
+                }
+                addBlock(noteId, noteChildren, "affine:table", {
+                    "prop:rows": rows, "prop:columns": columns, "prop:cells": cells,
+                    "prop:comments": undefined, "prop:textAlign": undefined,
+                });
+                continue;
+            }
+            // Skip unrecognized tokens
+            i++;
+        }
+    }
+    const writeDocFromMarkdownHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId)
+            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+        try {
+            await joinWorkspace(socket, workspaceId);
+            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+            if (!snapshot.missing)
+                throw new Error(`Document '${parsed.docId}' not found.`);
+            const doc = new Y.Doc();
+            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+            const blocks = doc.getMap("blocks");
+            const noteId = findBlockIdByFlavour(blocks, "affine:note");
+            if (!noteId)
+                throw new Error("Document has no note block.");
+            // Read current markdown for dry run / diff
+            if (parsed.dryRun) {
+                // Re-use the read handler logic to get current markdown
+                const currentResult = await readDocAsMarkdownHandler({ workspaceId, docId: parsed.docId });
+                const currentMd = JSON.parse(currentResult.content[0].text).markdown || "";
+                return text({ dryRun: true, currentMarkdown: currentMd, newMarkdown: parsed.markdown });
+            }
+            const prevSV = Y.encodeStateVector(doc);
+            const noteBlock = blocks.get(noteId);
+            const noteChildren = ensureChildrenArray(noteBlock);
+            // Delete all existing note children (clear doc body)
+            const existingChildIds = childIdsFrom(noteChildren);
+            // Remove children from note
+            if (noteChildren.length > 0)
+                noteChildren.delete(0, noteChildren.length);
+            // Remove child blocks recursively
+            function removeBlockTree(blockId) {
+                const block = blocks.get(blockId);
+                if (block instanceof Y.Map) {
+                    const kids = childIdsFrom(block.get("sys:children"));
+                    for (const kid of kids)
+                        removeBlockTree(kid);
+                }
+                blocks.delete(blockId);
+            }
+            for (const cid of existingChildIds)
+                removeBlockTree(cid);
+            // Parse markdown and create new blocks
+            // Strip leading title heading if it matches the doc title (avoid duplication)
+            let md = parsed.markdown;
+            const pageId = findBlockIdByFlavour(blocks, "affine:page");
+            if (pageId) {
+                const pageBlock = blocks.get(pageId);
+                const docTitle = asText(pageBlock?.get("prop:title"));
+                if (docTitle) {
+                    const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
+                    md = md.replace(titlePattern, "");
+                }
+            }
+            const mdTokens = mdParser.parse(md, {});
+            markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
+            const delta = Y.encodeStateAsUpdate(doc, prevSV);
+            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+            return text({ written: true, docId: parsed.docId, blocksCreated: noteChildren.length });
+        }
+        finally {
+            socket.disconnect();
+        }
+    };
+    server.registerTool("write_doc_from_markdown", {
+        title: "Write Document from Markdown",
+        description: "Replace the entire body of a document with content parsed from a markdown string. Supports headings, paragraphs, lists (bulleted/numbered/todo), code blocks, blockquotes, tables, dividers, latex ($$...$$), images, attachments (📎), and linked docs (affine://). Use dryRun=true to preview changes without writing. Inline formatting (bold, italic, code, links, strikethrough) is preserved.",
+        inputSchema: {
+            workspaceId: WorkspaceId.optional(),
+            docId: DocId,
+            markdown: z.string().describe("Markdown content to write into the document body"),
+            dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
+        },
+    }, writeDocFromMarkdownHandler);
     const publishDocHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId) {
