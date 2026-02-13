@@ -30,7 +30,25 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
       const query = `query ListDocs($workspaceId: String!, $first: Int, $offset: Int, $after: String){ workspace(id:$workspaceId){ docs(pagination:{first:$first, offset:$offset, after:$after}){ totalCount pageInfo{ hasNextPage endCursor } edges{ cursor node{ id workspaceId title summary public defaultRole createdAt updatedAt } } } } }`;
       const data = await gql.request<{ workspace: any }>(query, { workspaceId, first: parsed.first, offset: parsed.offset, after: parsed.after });
-      return text(data.workspace.docs);
+      const docs = data.workspace.docs;
+      // Enrich null titles by fetching individual doc metadata via GraphQL
+      const nullTitleEdges = docs.edges ? docs.edges.filter((e: any) => !e.node.title) : [];
+      if (nullTitleEdges.length > 0) {
+        const getDocQuery = `query GetDoc($workspaceId:String!, $docId:String!){ workspace(id:$workspaceId){ doc(docId:$docId){ id title summary } } }`;
+        const results = await Promise.allSettled(
+          nullTitleEdges.map((edge: any) =>
+            gql.request<{ workspace: any }>(getDocQuery, { workspaceId, docId: edge.node.id })
+          )
+        );
+        results.forEach((result, i) => {
+          if (result.status === 'fulfilled' && result.value?.workspace?.doc) {
+            const doc = result.value.workspace.doc;
+            if (doc.title) nullTitleEdges[i].node.title = doc.title;
+            if (doc.summary) nullTitleEdges[i].node.summary = doc.summary;
+          }
+        });
+      }
+      return text(docs);
     };
   server.registerTool(
     "list_docs",
@@ -145,7 +163,25 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       // Note: AFFiNE doesn't have a separate 'recentlyUpdatedDocs' field, just use docs
       const query = `query RecentDocs($workspaceId:String!, $first:Int, $offset:Int, $after:String){ workspace(id:$workspaceId){ docs(pagination:{first:$first, offset:$offset, after:$after}){ totalCount pageInfo{ hasNextPage endCursor } edges{ cursor node{ id workspaceId title summary public defaultRole createdAt updatedAt } } } } }`;
       const data = await gql.request<{ workspace: any }>(query, { workspaceId, first: parsed.first, offset: parsed.offset, after: parsed.after });
-      return text(data.workspace.docs);
+      const docs = data.workspace.docs;
+      // Enrich null titles by fetching individual doc metadata via GraphQL
+      const nullTitleEdges = docs.edges ? docs.edges.filter((e: any) => !e.node.title) : [];
+      if (nullTitleEdges.length > 0) {
+        const getDocQuery = `query GetDoc($workspaceId:String!, $docId:String!){ workspace(id:$workspaceId){ doc(docId:$docId){ id title summary } } }`;
+        const results = await Promise.allSettled(
+          nullTitleEdges.map((edge: any) =>
+            gql.request<{ workspace: any }>(getDocQuery, { workspaceId, docId: edge.node.id })
+          )
+        );
+        results.forEach((result, i) => {
+          if (result.status === 'fulfilled' && result.value?.workspace?.doc) {
+            const doc = result.value.workspace.doc;
+            if (doc.title) nullTitleEdges[i].node.title = doc.title;
+            if (doc.summary) nullTitleEdges[i].node.summary = doc.summary;
+          }
+        });
+      }
+      return text(docs);
     };
   server.registerTool(
     "recent_docs",
