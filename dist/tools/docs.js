@@ -1418,7 +1418,14 @@ export function registerDocTools(server, gql, defaults) {
                             lines.push("");
                         }
                         else {
-                            lines.push("*(empty table)*", "");
+                            const nRows = Math.max(sortedRowIds.length, 1);
+                            const nCols = Math.max(sortedColIds.length, 1);
+                            const emptyRow = `|${" |".repeat(nCols)}`;
+                            lines.push(emptyRow);
+                            lines.push(`|${" --- |".repeat(nCols)}`);
+                            for (let r = 1; r < nRows; r++)
+                                lines.push(emptyRow);
+                            lines.push("");
                         }
                         break;
                     }

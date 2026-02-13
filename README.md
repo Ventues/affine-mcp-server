@@ -215,34 +215,30 @@ Connection
 
 ## Release Process
 
-Every commit that changes functionality should produce a new release tgz. Follow these steps:
+When ready to cut a release:
 
-1. **Bump the version** in `package.json` (increment the `-fork.N` suffix):
-   ```bash
-   # e.g. 1.5.0-fork.2 → 1.5.0-fork.3
-   ```
-
+1. **Bump the version** in `package.json`
 2. **Build**:
    ```bash
    npm run build
    ```
-
-3. **Pack** and move to `release/`:
+3. **Pack** and replace the release tgz (only one tgz in `release/`):
    ```bash
    npm pack
+   rm -f release/*.tgz
    mv affine-mcp-server-*.tgz release/
    ```
-
-4. **Commit** everything (source, dist, tgz):
+4. **Commit and push**:
    ```bash
    git add -A
-   git commit -m "feat: <description> (v1.5.0-fork.N)"
-   ```
-
-5. **Push**:
-   ```bash
+   git commit -m "release: v<version>"
    git push origin main
    ```
+
+For local dev/testing, just build and install locally — no version bump needed:
+```bash
+npm run build && npm install -g .
+```
 
 ### Installing on other devices
 
