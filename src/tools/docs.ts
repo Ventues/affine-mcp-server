@@ -1547,7 +1547,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
             if (type === "quote") {
               lines.push(`> ${blockText}`, "");
             } else {
-              lines.push(blockText, "");
+              if (blockText) lines.push(blockText, "");
             }
             // Render nested children (e.g. indented content under a paragraph)
             for (const cid of childIds) renderBlock(cid, depth, []);
@@ -1616,9 +1616,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         prevWasList = isList;
       }
 
-      // Clean up trailing blank lines
-      while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
-      const markdown = lines.join("\n") + "\n";
+      // Clean up: collapse consecutive blank lines into one
+      const collapsed: string[] = [];
+      for (const line of lines) {
+        if (line === "" && collapsed.length > 0 && collapsed[collapsed.length - 1] === "") continue;
+        collapsed.push(line);
+      }
+      while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") collapsed.pop();
+      const markdown = collapsed.join("\n") + "\n";
 
       return text({ docId: parsed.docId, exists: true, title, markdown });
     } finally {
