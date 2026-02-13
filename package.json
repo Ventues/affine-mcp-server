@@ -8,7 +8,7 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/dawncr0w/affine-mcp-server.git"
+    "url": "git+https://github.com/Ventues/affine-mcp-server.git"
   },
   "keywords": [
     "mcp",
@@ -26,6 +26,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "prepare": "npm run build",
     "prepublishOnly": "npm run build"
   },
   "files": [
