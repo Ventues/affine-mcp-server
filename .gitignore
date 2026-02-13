@@ -45,4 +45,5 @@ temp/
 *.tmp
 
 # Package artifacts
-*.tgz
+# Keep release/*.tgz but ignore root level
+/affine-mcp-server-*.tgz
