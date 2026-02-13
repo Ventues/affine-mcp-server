@@ -26,6 +26,7 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "test": "tsx --test test/integration.test.ts",
     "prepublishOnly": "npm run build"
   },
   "files": [
