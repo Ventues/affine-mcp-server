@@ -1337,18 +1337,17 @@ export function registerDocTools(server, gql, defaults) {
                         if (type && type.startsWith("h") && type.length === 2) {
                             const level = parseInt(type[1], 10);
                             if (level >= 1 && level <= 6) {
-                                lines.push(`${"#".repeat(level)} ${blockText}`, "");
+                                lines.push(`${indent}${"#".repeat(level)} ${blockText}`, "");
                                 break;
                             }
                         }
                         if (type === "quote") {
-                            lines.push(`> ${blockText}`, "");
+                            lines.push(`${indent}> ${blockText}`, "");
                         }
                         else {
                             if (blockText)
-                                lines.push(blockText, "");
+                                lines.push(`${indent}${blockText}`, "");
                         }
-                        // Render nested children (e.g. indented content under a paragraph)
                         for (const cid of childIds)
                             renderBlock(cid, depth, []);
                         break;
@@ -1378,7 +1377,7 @@ export function registerDocTools(server, gql, defaults) {
                     }
                     case "affine:code": {
                         const lang = raw.get("prop:language") || "";
-                        lines.push(`\`\`\`${lang}`, blockText, "```", "");
+                        lines.push(`${indent}\`\`\`${lang}`, blockText, `${indent}\`\`\``, "");
                         break;
                     }
                     case "affine:divider": {
@@ -1386,7 +1385,6 @@ export function registerDocTools(server, gql, defaults) {
                         break;
                     }
                     case "affine:table": {
-                        // Read table structure from Y.Map
                         const rowsRaw = raw.get("prop:rows");
                         const colsRaw = raw.get("prop:columns");
                         const cellsRaw = raw.get("prop:cells");
@@ -1394,24 +1392,34 @@ export function registerDocTools(server, gql, defaults) {
                             const toObj = (v) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
                             const rowsObj = toObj(rowsRaw);
                             const colsObj = toObj(colsRaw);
-                            const cellsObj = toObj(cellsRaw);
                             const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
                             const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
                             if (sortedRowIds.length > 0 && sortedColIds.length > 0) {
-                                for (let r = 0; r < sortedRowIds.length; r++) {
-                                    const cells = sortedColIds.map(cid => {
-                                        const cell = cellsRaw instanceof Y.Map ? cellsRaw.get(`${sortedRowIds[r]}:${cid}`) : cellsObj[`${sortedRowIds[r]}:${cid}`];
+                                const readCell = (rowId, colId) => {
+                                    const key = `${rowId}:${colId}`;
+                                    if (cellsRaw instanceof Y.Map) {
+                                        const cell = cellsRaw.get(key);
                                         if (cell instanceof Y.Map)
                                             return asText(cell.get("text"));
-                                        if (typeof cell === "object" && cell && "text" in cell)
-                                            return String(cell.text ?? "");
-                                        return "";
-                                    });
+                                        if (cell instanceof Y.Text)
+                                            return cell.toString();
+                                    }
+                                    const obj = toObj(cellsRaw);
+                                    const c = obj[key];
+                                    if (c && typeof c === "object" && "text" in c)
+                                        return String(c.text ?? "");
+                                    return "";
+                                };
+                                for (let r = 0; r < sortedRowIds.length; r++) {
+                                    const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
                                     lines.push(`| ${cells.join(" | ")} |`);
                                     if (r === 0)
                                         lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
                                 }
                                 lines.push("");
+                            }
+                            else {
+                                lines.push("*(empty table)*", "");
                             }
                         }
                         break;
@@ -1419,7 +1427,25 @@ export function registerDocTools(server, gql, defaults) {
                     case "affine:latex": {
                         const latex = raw.get("prop:latex") || "";
                         if (latex)
-                            lines.push(`$$`, latex, `$$`, "");
+                            lines.push(`${indent}$$${latex}$$`, "");
+                        break;
+                    }
+                    case "affine:image": {
+                        const caption = raw.get("prop:caption") || "";
+                        lines.push(`${indent}![${caption}](image)`, "");
+                        break;
+                    }
+                    case "affine:attachment": {
+                        const name = raw.get("prop:name") || "attachment";
+                        lines.push(`${indent}📎 ${name}`, "");
+                        break;
+                    }
+                    case "affine:database": {
+                        const dbTitle = asText(raw.get("prop:title"));
+                        if (dbTitle)
+                            lines.push(`${indent}**${dbTitle}**`, "");
+                        for (const cid of childIds)
+                            renderBlock(cid, depth, []);
                         break;
                     }
                     case "affine:bookmark": {
