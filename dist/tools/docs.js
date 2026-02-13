@@ -1385,6 +1385,43 @@ export function registerDocTools(server, gql, defaults) {
                         lines.push("---", "");
                         break;
                     }
+                    case "affine:table": {
+                        // Read table structure from Y.Map
+                        const rowsRaw = raw.get("prop:rows");
+                        const colsRaw = raw.get("prop:columns");
+                        const cellsRaw = raw.get("prop:cells");
+                        if (rowsRaw && colsRaw && cellsRaw) {
+                            const toObj = (v) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
+                            const rowsObj = toObj(rowsRaw);
+                            const colsObj = toObj(colsRaw);
+                            const cellsObj = toObj(cellsRaw);
+                            const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
+                            const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
+                            if (sortedRowIds.length > 0 && sortedColIds.length > 0) {
+                                for (let r = 0; r < sortedRowIds.length; r++) {
+                                    const cells = sortedColIds.map(cid => {
+                                        const cell = cellsRaw instanceof Y.Map ? cellsRaw.get(`${sortedRowIds[r]}:${cid}`) : cellsObj[`${sortedRowIds[r]}:${cid}`];
+                                        if (cell instanceof Y.Map)
+                                            return asText(cell.get("text"));
+                                        if (typeof cell === "object" && cell && "text" in cell)
+                                            return String(cell.text ?? "");
+                                        return "";
+                                    });
+                                    lines.push(`| ${cells.join(" | ")} |`);
+                                    if (r === 0)
+                                        lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
+                                }
+                                lines.push("");
+                            }
+                        }
+                        break;
+                    }
+                    case "affine:latex": {
+                        const latex = raw.get("prop:latex") || "";
+                        if (latex)
+                            lines.push(`$$`, latex, `$$`, "");
+                        break;
+                    }
                     case "affine:bookmark": {
                         const url = raw.get("prop:url") || "";
                         const bmTitle = raw.get("prop:title") || url;
