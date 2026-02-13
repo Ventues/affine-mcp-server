@@ -1,0 +1,45 @@
+const defaultEndpoints = {
+    listWorkspaces: { method: "GET", path: "/api/workspaces" },
+    listDocs: { method: "GET", path: "/api/workspaces/:workspaceId/docs" },
+    getDoc: { method: "GET", path: "/api/docs/:docId" },
+    createDoc: { method: "POST", path: "/api/workspaces/:workspaceId/docs" },
+    updateDoc: { method: "PATCH", path: "/api/docs/:docId" },
+    deleteDoc: { method: "DELETE", path: "/api/docs/:docId" },
+    searchDocs: {
+        method: "GET",
+        path: "/api/workspaces/:workspaceId/search"
+    }
+};
+export function loadConfig() {
+    const baseUrl = process.env.AFFINE_BASE_URL?.replace(/\/$/, "") || "http://localhost:3010";
+    const apiToken = process.env.AFFINE_API_TOKEN;
+    const cookie = process.env.AFFINE_COOKIE;
+    const email = process.env.AFFINE_EMAIL;
+    const password = process.env.AFFINE_PASSWORD;
+    let headers = undefined;
+    const headersJson = process.env.AFFINE_HEADERS_JSON;
+    if (headersJson) {
+        try {
+            headers = JSON.parse(headersJson);
+        }
+        catch (e) {
+            console.warn("Failed to parse AFFINE_HEADERS_JSON; ignoring.");
+        }
+    }
+    if (cookie) {
+        headers = { ...(headers || {}), Cookie: cookie };
+    }
+    const graphqlPath = process.env.AFFINE_GRAPHQL_PATH || "/graphql";
+    const defaultWorkspaceId = process.env.AFFINE_WORKSPACE_ID;
+    let endpoints = defaultEndpoints;
+    const endpointsJson = process.env.AFFINE_ENDPOINTS_JSON;
+    if (endpointsJson) {
+        try {
+            endpoints = { ...defaultEndpoints, ...JSON.parse(endpointsJson) };
+        }
+        catch (e) {
+            console.warn("Failed to parse AFFINE_ENDPOINTS_JSON; using defaults.");
+        }
+    }
+    return { baseUrl, apiToken, cookie, headers, graphqlPath, email, password, defaultWorkspaceId, endpoints };
+}
