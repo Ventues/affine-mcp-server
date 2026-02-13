@@ -996,6 +996,27 @@ export function registerDocTools(server, gql, defaults) {
             }
         }
     }
+    /** Update the updatedDate for a doc in the workspace root meta pages list */
+    async function touchDocMeta(socket, workspaceId, docId) {
+        const wsDoc = new Y.Doc();
+        const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+        if (snapshot.missing)
+            Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+        const prevSV = Y.encodeStateVector(wsDoc);
+        const wsMeta = wsDoc.getMap("meta");
+        const pages = wsMeta.get("pages");
+        if (pages) {
+            pages.forEach((entry) => {
+                if (entry?.get && entry.get("id") === docId) {
+                    entry.set("updatedDate", Date.now());
+                }
+            });
+        }
+        const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+        if (delta.byteLength > 0) {
+            await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(delta).toString("base64"));
+        }
+    }
     async function appendBlockInternal(parsed) {
         const normalized = normalizeAppendBlockInput(parsed);
         const workspaceId = normalized.workspaceId || defaults.workspaceId;
@@ -1024,6 +1045,7 @@ export function registerDocTools(server, gql, defaults) {
             }
             const delta = Y.encodeStateAsUpdate(doc, prevSV);
             await pushDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"));
+            await touchDocMeta(socket, workspaceId, normalized.docId);
             return { appended: true, blockId, flavour, blockType, normalizedType: normalized.type, legacyType: normalized.legacyType || null };
         }
         finally {
@@ -1972,6 +1994,7 @@ export function registerDocTools(server, gql, defaults) {
             markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
             const delta = Y.encodeStateAsUpdate(doc, prevSV);
             await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+            await touchDocMeta(socket, workspaceId, parsed.docId);
             return text({ written: true, docId: parsed.docId, blocksCreated: noteChildren.length });
         }
         finally {
@@ -2128,6 +2151,7 @@ export function registerDocTools(server, gql, defaults) {
             entry.set('id', docId);
             entry.set('title', parsed.title || 'Untitled');
             entry.set('createDate', Date.now());
+            entry.set('updatedDate', Date.now());
             entry.set('tags', new Y.Array());
             pages.push([entry]);
             const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
