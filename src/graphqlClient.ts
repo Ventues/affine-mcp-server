@@ -32,6 +32,17 @@ export class GraphQLClient {
     return this.authenticated;
   }
 
+  get endpoint(): string {
+    return this.opts.endpoint;
+  }
+
+  getAuthHeaders(): Record<string, string> {
+    const h: Record<string, string> = {};
+    if (this.headers["Authorization"]) h["Authorization"] = this.headers["Authorization"];
+    if (this.headers["Cookie"]) h["Cookie"] = this.headers["Cookie"];
+    return h;
+  }
+
   async request<T>(query: string, variables?: Record<string, any>): Promise<T> {
     const headers: Record<string, string> = { "Content-Type": "application/json", ...this.headers };
     const res = await fetch(this.opts.endpoint, {

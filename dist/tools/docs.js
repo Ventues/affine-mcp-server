@@ -13,11 +13,10 @@ export function registerDocTools(server, gql, defaults) {
             id += chars.charAt(Math.floor(Math.random() * chars.length));
         return id;
     }
-    async function getCookieAndEndpoint() {
-        const endpoint = gql.endpoint || process.env.AFFINE_BASE_URL + '/graphql';
-        const headers = gql.headers || {};
-        const cookie = gql.cookie || headers.Cookie || '';
-        return { endpoint, cookie };
+    function getEndpointAndAuthHeaders() {
+        const endpoint = gql.endpoint;
+        const authHeaders = gql.getAuthHeaders();
+        return { endpoint, authHeaders };
     }
     const listDocsHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -90,18 +89,65 @@ export function registerDocTools(server, gql, defaults) {
         }
     }, getDocHandler);
     const searchDocsHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId) {
+            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+        }
+        // Try server-side search first
         try {
-            const workspaceId = parsed.workspaceId || defaults.workspaceId;
-            if (!workspaceId) {
-                throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-            }
             const query = `query SearchDocs($workspaceId:String!, $keyword:String!, $limit:Int){ workspace(id:$workspaceId){ searchDocs(input:{ keyword:$keyword, limit:$limit }){ docId title highlight createdAt updatedAt } } }`;
             const data = await gql.request(query, { workspaceId, keyword: parsed.keyword, limit: parsed.limit });
-            return text(data.workspace?.searchDocs || []);
+            const results = data.workspace?.searchDocs;
+            if (results && results.length > 0) {
+                return text(results);
+            }
         }
         catch (error) {
-            // Return empty array on error (search might not be available)
-            console.error("Search docs error:", error.message);
+            console.error("Server-side search unavailable, falling back to client-side search:", error.message);
+        }
+        // Fallback: client-side search by fetching all docs and filtering by title/summary
+        try {
+            const listQuery = `query ListAllDocs($workspaceId: String!){ workspace(id:$workspaceId){ docs(pagination:{first:100}){ edges{ node{ id workspaceId title summary createdAt updatedAt } } } } }`;
+            const listData = await gql.request(listQuery, { workspaceId });
+            const allEdges = listData.workspace.docs.edges || [];
+            // Enrich null titles
+            const nullTitleEdges = allEdges.filter((e) => !e.node.title);
+            if (nullTitleEdges.length > 0) {
+                const getDocQuery = `query GetDoc($workspaceId:String!, $docId:String!){ workspace(id:$workspaceId){ doc(docId:$docId){ id title summary } } }`;
+                const results = await Promise.allSettled(nullTitleEdges.map((edge) => gql.request(getDocQuery, { workspaceId, docId: edge.node.id })));
+                results.forEach((result, i) => {
+                    if (result.status === 'fulfilled' && result.value?.workspace?.doc) {
+                        const doc = result.value.workspace.doc;
+                        if (doc.title)
+                            nullTitleEdges[i].node.title = doc.title;
+                        if (doc.summary)
+                            nullTitleEdges[i].node.summary = doc.summary;
+                    }
+                });
+            }
+            // Search by keyword in title and summary (case-insensitive)
+            const kw = parsed.keyword.toLowerCase();
+            const keywords = kw.split(/\s+/);
+            const matched = allEdges
+                .map((e) => e.node)
+                .filter((doc) => {
+                const title = (doc.title || '').toLowerCase();
+                const summary = (doc.summary || '').toLowerCase();
+                const combined = title + ' ' + summary;
+                return keywords.every((k) => combined.includes(k));
+            })
+                .slice(0, parsed.limit || 20)
+                .map((doc) => ({
+                docId: doc.id,
+                title: doc.title,
+                summary: doc.summary,
+                createdAt: doc.createdAt,
+                updatedAt: doc.updatedAt
+            }));
+            return text(matched);
+        }
+        catch (fallbackError) {
+            console.error("Client-side search also failed:", fallbackError.message);
             return text([]);
         }
     };
@@ -226,9 +272,9 @@ export function registerDocTools(server, gql, defaults) {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
-        const { endpoint, cookie } = await getCookieAndEndpoint();
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
         const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-        const socket = await connectWorkspaceSocket(wsUrl, cookie);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         try {
             await joinWorkspace(socket, workspaceId);
             // 1) Create doc content
@@ -339,9 +385,9 @@ export function registerDocTools(server, gql, defaults) {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error('workspaceId is required');
-        const { endpoint, cookie } = await getCookieAndEndpoint();
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
         const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-        const socket = await connectWorkspaceSocket(wsUrl, cookie);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         try {
             await joinWorkspace(socket, workspaceId);
             const doc = new Y.Doc();
@@ -433,9 +479,9 @@ export function registerDocTools(server, gql, defaults) {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error('workspaceId is required');
-        const { endpoint, cookie } = await getCookieAndEndpoint();
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
         const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-        const socket = await connectWorkspaceSocket(wsUrl, cookie);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         try {
             await joinWorkspace(socket, workspaceId);
             // remove from workspace pages

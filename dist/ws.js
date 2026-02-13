@@ -5,12 +5,12 @@ export function wsUrlFromGraphQLEndpoint(endpoint) {
         .replace('http://', 'ws://')
         .replace(/\/graphql\/?$/, '');
 }
-export async function connectWorkspaceSocket(wsUrl, cookie) {
+export async function connectWorkspaceSocket(wsUrl, extraHeaders) {
     return new Promise((resolve, reject) => {
         const socket = io(wsUrl, {
             transports: ['websocket'],
             path: '/socket.io/',
-            extraHeaders: cookie ? { Cookie: cookie } : undefined,
+            extraHeaders: extraHeaders && Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
             autoConnect: true
         });
         const onError = (err) => {
@@ -31,9 +31,11 @@ export async function connectWorkspaceSocket(wsUrl, cookie) {
 }
 export async function joinWorkspace(socket, workspaceId) {
     return new Promise((resolve, reject) => {
-        socket.emit('space:join', { spaceType: 'workspace', spaceId: workspaceId, clientVersion: 'mcp' }, (ack) => {
+        socket.emit('space:join', { spaceType: 'workspace', spaceId: workspaceId, clientVersion: process.env.AFFINE_SERVER_VERSION || '0.26.2' }, (ack) => {
             if (ack?.error)
                 return reject(new Error(ack.error.message || 'join failed'));
+            if (ack?.data?.success === false)
+                return reject(new Error('space:join returned success=false (clientVersion mismatch?)'));
             resolve();
         });
     });

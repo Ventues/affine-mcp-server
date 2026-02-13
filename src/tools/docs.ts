@@ -17,11 +17,10 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     return id;
   }
 
-  async function getCookieAndEndpoint() {
-    const endpoint = (gql as any).endpoint || process.env.AFFINE_BASE_URL + '/graphql';
-    const headers = (gql as any).headers || {};
-    const cookie = (gql as any).cookie || headers.Cookie || '';
-    return { endpoint, cookie };
+  function getEndpointAndAuthHeaders() {
+    const endpoint = gql.endpoint;
+    const authHeaders = gql.getAuthHeaders();
+    return { endpoint, authHeaders };
   }
   const listDocsHandler = async (parsed: { workspaceId?: string; first?: number; offset?: number; after?: string }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -114,17 +113,65 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   const searchDocsHandler = async (parsed: { workspaceId?: string; keyword: string; limit?: number }) => {
-      try {
-        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+      const workspaceId = parsed.workspaceId || defaults.workspaceId;
       if (!workspaceId) {
         throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
       }
+      // Try server-side search first
+      try {
         const query = `query SearchDocs($workspaceId:String!, $keyword:String!, $limit:Int){ workspace(id:$workspaceId){ searchDocs(input:{ keyword:$keyword, limit:$limit }){ docId title highlight createdAt updatedAt } } }`;
         const data = await gql.request<{ workspace: any }>(query, { workspaceId, keyword: parsed.keyword, limit: parsed.limit });
-        return text(data.workspace?.searchDocs || []);
+        const results = data.workspace?.searchDocs;
+        if (results && results.length > 0) {
+          return text(results);
+        }
       } catch (error: any) {
-        // Return empty array on error (search might not be available)
-        console.error("Search docs error:", error.message);
+        console.error("Server-side search unavailable, falling back to client-side search:", error.message);
+      }
+      // Fallback: client-side search by fetching all docs and filtering by title/summary
+      try {
+        const listQuery = `query ListAllDocs($workspaceId: String!){ workspace(id:$workspaceId){ docs(pagination:{first:100}){ edges{ node{ id workspaceId title summary createdAt updatedAt } } } } }`;
+        const listData = await gql.request<{ workspace: any }>(listQuery, { workspaceId });
+        const allEdges = listData.workspace.docs.edges || [];
+        // Enrich null titles
+        const nullTitleEdges = allEdges.filter((e: any) => !e.node.title);
+        if (nullTitleEdges.length > 0) {
+          const getDocQuery = `query GetDoc($workspaceId:String!, $docId:String!){ workspace(id:$workspaceId){ doc(docId:$docId){ id title summary } } }`;
+          const results = await Promise.allSettled(
+            nullTitleEdges.map((edge: any) =>
+              gql.request<{ workspace: any }>(getDocQuery, { workspaceId, docId: edge.node.id })
+            )
+          );
+          results.forEach((result, i) => {
+            if (result.status === 'fulfilled' && result.value?.workspace?.doc) {
+              const doc = result.value.workspace.doc;
+              if (doc.title) nullTitleEdges[i].node.title = doc.title;
+              if (doc.summary) nullTitleEdges[i].node.summary = doc.summary;
+            }
+          });
+        }
+        // Search by keyword in title and summary (case-insensitive)
+        const kw = parsed.keyword.toLowerCase();
+        const keywords = kw.split(/\s+/);
+        const matched = allEdges
+          .map((e: any) => e.node)
+          .filter((doc: any) => {
+            const title = (doc.title || '').toLowerCase();
+            const summary = (doc.summary || '').toLowerCase();
+            const combined = title + ' ' + summary;
+            return keywords.every((k: string) => combined.includes(k));
+          })
+          .slice(0, parsed.limit || 20)
+          .map((doc: any) => ({
+            docId: doc.id,
+            title: doc.title,
+            summary: doc.summary,
+            createdAt: doc.createdAt,
+            updatedAt: doc.updatedAt
+          }));
+        return text(matched);
+      } catch (fallbackError: any) {
+        console.error("Client-side search also failed:", fallbackError.message);
         return text([]);
       }
     };
@@ -286,9 +333,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   const createDocHandler = async (parsed: { workspaceId?: string; title?: string; content?: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID.");
-    const { endpoint, cookie } = await getCookieAndEndpoint();
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
 
@@ -414,9 +461,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   const appendParagraphHandler = async (parsed: { workspaceId?: string; docId: string; text: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error('workspaceId is required');
-    const { endpoint, cookie } = await getCookieAndEndpoint();
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
       const doc = new Y.Doc();
@@ -514,9 +561,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   const deleteDocHandler = async (parsed: { workspaceId?: string; docId: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error('workspaceId is required');
-    const { endpoint, cookie } = await getCookieAndEndpoint();
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, cookie);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
       // remove from workspace pages
