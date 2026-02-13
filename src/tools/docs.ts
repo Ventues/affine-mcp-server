@@ -1486,6 +1486,158 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     readDocHandler as any
   );
 
+  // ── read_doc_as_markdown ──────────────────────────────────────────────
+  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) {
+      throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+    }
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+
+      if (!snapshot.missing) {
+        return text({ docId: parsed.docId, exists: false, markdown: "" });
+      }
+
+      const doc = new Y.Doc();
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      const noteId = findBlockIdByFlavour(blocks, "affine:note");
+
+      let title = "";
+      if (pageId) {
+        const pageBlock = blocks.get(pageId) as Y.Map<any>;
+        if (pageBlock) title = asText(pageBlock.get("prop:title"));
+      }
+
+      // Collect note children in order
+      const noteBlock = noteId ? blocks.get(noteId) as Y.Map<any> : null;
+      if (!noteBlock) {
+        return text({ docId: parsed.docId, exists: true, title, markdown: title ? `# ${title}\n` : "" });
+      }
+
+      const lines: string[] = [];
+      if (title) lines.push(`# ${title}`, "");
+
+      const renderBlock = (blockId: string, depth: number, listIndex: number[]): void => {
+        const raw = blocks.get(blockId);
+        if (!(raw instanceof Y.Map)) return;
+
+        const flavour = raw.get("sys:flavour") as string;
+        const type = raw.get("prop:type") as string | undefined;
+        const blockText = asText(raw.get("prop:text"));
+        const childIds = childIdsFrom(raw.get("sys:children"));
+        const indent = "  ".repeat(depth);
+
+        switch (flavour) {
+          case "affine:paragraph": {
+            if (type && type.startsWith("h") && type.length === 2) {
+              const level = parseInt(type[1], 10);
+              if (level >= 1 && level <= 6) {
+                lines.push(`${"#".repeat(level)} ${blockText}`, "");
+                break;
+              }
+            }
+            if (type === "quote") {
+              lines.push(`> ${blockText}`, "");
+            } else {
+              lines.push(blockText, "");
+            }
+            // Render nested children (e.g. indented content under a paragraph)
+            for (const cid of childIds) renderBlock(cid, depth, []);
+            break;
+          }
+          case "affine:list": {
+            const checked = raw.get("prop:checked");
+            let prefix: string;
+            let listText = blockText;
+            if (type === "todo") {
+              prefix = checked ? "- [x]" : "- [ ]";
+            } else if (type === "numbered") {
+              const num = (listIndex[depth] ?? 0) + 1;
+              listIndex[depth] = num;
+              prefix = `${num}.`;
+              // Strip leading "N. " if AFFiNE baked the number into the text
+              listText = listText.replace(/^\d+\.\s*/, "");
+            } else {
+              prefix = "-";
+            }
+            lines.push(`${indent}${prefix} ${listText}`);
+            // Nested list children
+            for (const cid of childIds) renderBlock(cid, depth + 1, listIndex);
+            break;
+          }
+          case "affine:code": {
+            const lang = raw.get("prop:language") || "";
+            lines.push(`\`\`\`${lang}`, blockText, "```", "");
+            break;
+          }
+          case "affine:divider": {
+            lines.push("---", "");
+            break;
+          }
+          case "affine:bookmark": {
+            const url = raw.get("prop:url") || "";
+            const bmTitle = raw.get("prop:title") || url;
+            lines.push(`[${bmTitle}](${url})`, "");
+            break;
+          }
+          case "affine:embed-linked-doc": {
+            const pid = raw.get("prop:pageId") || "";
+            const docTitle = raw.get("prop:title") || "Linked Doc";
+            lines.push(`[${docTitle}](affine://${pid})`, "");
+            break;
+          }
+          default: {
+            // For unsupported blocks, emit text if present
+            if (blockText) lines.push(blockText, "");
+            break;
+          }
+        }
+      };
+
+      const noteChildIds = childIdsFrom(noteBlock.get("sys:children"));
+      const listIndex: number[] = [];
+      let prevWasList = false;
+      for (const childId of noteChildIds) {
+        const raw = blocks.get(childId);
+        const isList = raw instanceof Y.Map && raw.get("sys:flavour") === "affine:list";
+        if (!isList) {
+          if (prevWasList) lines.push(""); // blank line after list group
+          listIndex.length = 0;
+        }
+        renderBlock(childId, 0, listIndex);
+        prevWasList = isList;
+      }
+
+      // Clean up trailing blank lines
+      while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+      const markdown = lines.join("\n") + "\n";
+
+      return text({ docId: parsed.docId, exists: true, title, markdown });
+    } finally {
+      socket.disconnect();
+    }
+  };
+  server.registerTool(
+    "read_doc_as_markdown",
+    {
+      title: "Read Document as Markdown",
+      description: "Read a document and return its content as a markdown string. Much more readable than raw blocks.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        docId: DocId,
+      },
+    },
+    readDocAsMarkdownHandler as any
+  );
+
   const publishDocHandler = async (parsed: { workspaceId?: string; docId: string; mode?: "Page" | "Edgeless" }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
       if (!workspaceId) {
