@@ -16,7 +16,7 @@ import { loginWithPassword } from "./auth.js";
 import { registerAuthTools } from "./tools/auth.js";
 const config = loadConfig();
 async function buildServer() {
-    const server = new McpServer({ name: "affine-mcp", version: "1.2.2" });
+    const server = new McpServer({ name: "affine-mcp", version: "1.5.0-fork.1" });
     // Initialize GraphQL client with authentication
     const gql = new GraphQLClient({
         endpoint: `${config.baseUrl}${config.graphqlPath}`,
