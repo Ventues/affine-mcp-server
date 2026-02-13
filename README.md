@@ -213,6 +213,43 @@ Connection
 - Basic workspace and document operations
 - Full authentication support
 
+## Release Process
+
+Every commit that changes functionality should produce a new release tgz. Follow these steps:
+
+1. **Bump the version** in `package.json` (increment the `-fork.N` suffix):
+   ```bash
+   # e.g. 1.5.0-fork.2 → 1.5.0-fork.3
+   ```
+
+2. **Build**:
+   ```bash
+   npm run build
+   ```
+
+3. **Pack** and move to `release/`:
+   ```bash
+   npm pack
+   mv affine-mcp-server-*.tgz release/
+   ```
+
+4. **Commit** everything (source, dist, tgz):
+   ```bash
+   git add -A
+   git commit -m "feat: <description> (v1.5.0-fork.N)"
+   ```
+
+5. **Push**:
+   ```bash
+   git push origin main
+   ```
+
+### Installing on other devices
+
+```bash
+npm install -g https://github.com/Ventues/affine-mcp-server/raw/main/release/affine-mcp-server-<version>.tgz
+```
+
 ## Contributing
 
 Contributions are welcome!
