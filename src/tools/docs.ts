@@ -1534,7 +1534,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   // ── read_doc_as_markdown ──────────────────────────────────────────────
-  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string }) => {
+  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; includeBlockIds?: boolean }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -1563,192 +1563,43 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         if (pageBlock) title = asText(pageBlock.get("prop:title"));
       }
 
-      // Collect note children in order
       const noteBlock = noteId ? blocks.get(noteId) as Y.Map<any> : null;
       if (!noteBlock) {
         return text({ docId: parsed.docId, exists: true, title, markdown: title ? `# ${title}\n` : "" });
       }
 
-      const lines: string[] = [];
-      if (title) lines.push(`# ${title}`, "");
+      const { markdown, blockLineRanges } = blocksToMarkdownWithMap(blocks, noteBlock, title);
 
-      const renderBlock = (blockId: string, depth: number, listIndex: number[]): void => {
-        const raw = blocks.get(blockId);
-        if (!(raw instanceof Y.Map)) return;
-
-        const flavour = raw.get("sys:flavour") as string;
-        const type = raw.get("prop:type") as string | undefined;
-        const blockText = richTextToMarkdown(raw.get("prop:text"));
-        const childIds = childIdsFrom(raw.get("sys:children"));
-        const indent = "  ".repeat(depth);
-
-        switch (flavour) {
-          case "affine:paragraph": {
-            if (type && type.startsWith("h") && type.length === 2) {
-              const level = parseInt(type[1], 10);
-              if (level >= 1 && level <= 6) {
-                lines.push(`${indent}${"#".repeat(level)} ${blockText}`, "");
-                break;
-              }
-            }
-            if (type === "quote") {
-              lines.push(`${indent}> ${blockText}`, "");
-            } else {
-              if (blockText) lines.push(`${indent}${blockText}`, "");
-            }
-            for (const cid of childIds) renderBlock(cid, depth, []);
-            break;
-          }
-          case "affine:list": {
-            const checked = raw.get("prop:checked");
-            let prefix: string;
-            let listText = blockText;
-            if (type === "todo") {
-              prefix = checked ? "- [x]" : "- [ ]";
-            } else if (type === "numbered") {
-              const num = (listIndex[depth] ?? 0) + 1;
-              listIndex[depth] = num;
-              prefix = `${num}.`;
-              // Strip leading "N. " if AFFiNE baked the number into the text
-              listText = listText.replace(/^\d+\.\s*/, "");
-            } else {
-              prefix = "-";
-            }
-            lines.push(`${indent}${prefix} ${listText}`);
-            // Nested list children
-            for (const cid of childIds) renderBlock(cid, depth + 1, listIndex);
-            break;
-          }
-          case "affine:code": {
-            const lang = raw.get("prop:language") || "";
-            lines.push(`${indent}\`\`\`${lang}`, blockText, `${indent}\`\`\``, "");
-            break;
-          }
-          case "affine:divider": {
-            lines.push("---", "");
-            break;
-          }
-          case "affine:table": {
-            const rowsRaw = raw.get("prop:rows");
-            const colsRaw = raw.get("prop:columns");
-            const cellsRaw = raw.get("prop:cells");
-            const toObj = (v: unknown) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
-            const rowsObj = rowsRaw ? toObj(rowsRaw) as Record<string, { order?: string }> : {};
-            const colsObj = colsRaw ? toObj(colsRaw) as Record<string, { order?: string }> : {};
-            const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
-            const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
-            if (sortedRowIds.length > 0 && sortedColIds.length > 0 && cellsRaw) {
-              const readCell = (rowId: string, colId: string): string => {
-                const key = `${rowId}:${colId}`;
-                if (cellsRaw instanceof Y.Map) {
-                  const cell = cellsRaw.get(key);
-                  if (cell instanceof Y.Map) return richTextToMarkdown(cell.get("text"));
-                  if (cell instanceof Y.Text) return richTextToMarkdown(cell);
-                }
-                const obj = toObj(cellsRaw) as Record<string, any>;
-                const c = obj[key];
-                if (c && typeof c === "object" && "text" in c) return String(c.text ?? "");
-                return "";
-              };
-              for (let r = 0; r < sortedRowIds.length; r++) {
-                const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
-                lines.push(`| ${cells.join(" | ")} |`);
-                if (r === 0) lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
-              }
-              lines.push("");
-            } else {
-              const nRows = Math.max(sortedRowIds.length, 1);
-              const nCols = Math.max(sortedColIds.length, 1);
-              const emptyRow = `|${" |".repeat(nCols)}`;
-              lines.push(emptyRow);
-              lines.push(`|${" --- |".repeat(nCols)}`);
-              for (let r = 1; r < nRows; r++) lines.push(emptyRow);
-              lines.push("");
-            }
-            break;
-          }
-          case "affine:latex": {
-            const latex = raw.get("prop:latex") || "";
-            if (latex) lines.push(`${indent}$$${latex}$$`, "");
-            break;
-          }
-          case "affine:image": {
-            const caption = raw.get("prop:caption") || "";
-            lines.push(`${indent}![${caption}](image)`, "");
-            break;
-          }
-          case "affine:attachment": {
-            const name = raw.get("prop:name") || "attachment";
-            lines.push(`${indent}📎 ${name}`, "");
-            break;
-          }
-          case "affine:database": {
-            const dbTitle = asText(raw.get("prop:title")) || blockText;
-            if (dbTitle) lines.push(`${indent}**${dbTitle}**`, "");
-            for (const cid of childIds) renderBlock(cid, depth, []);
-            if (!dbTitle && childIds.length === 0) lines.push("*(database)*", "");
-            break;
-          }
-          case "affine:bookmark": {
-            const url = raw.get("prop:url") || "";
-            const bmTitle = raw.get("prop:title") || url;
-            lines.push(`[${bmTitle}](${url})`, "");
-            break;
-          }
-          case "affine:embed-linked-doc": {
-            const pid = raw.get("prop:pageId") || "";
-            const docTitle = raw.get("prop:title") || "Linked Doc";
-            lines.push(`[${docTitle}](affine://${pid})`, "");
-            break;
-          }
-          default: {
-            // For unsupported blocks, emit text if present
-            if (blockText) lines.push(blockText, "");
-            break;
-          }
-        }
-      };
-
-      const noteChildIds = childIdsFrom(noteBlock.get("sys:children"));
-      const listIndex: number[] = [];
-      let prevWasList = false;
-      for (const childId of noteChildIds) {
-        const raw = blocks.get(childId);
-        const isList = raw instanceof Y.Map && raw.get("sys:flavour") === "affine:list";
-        if (!isList) {
-          if (prevWasList) lines.push(""); // blank line after list group
-          listIndex.length = 0;
-        }
-        renderBlock(childId, 0, listIndex);
-        prevWasList = isList;
+      const result: any = { docId: parsed.docId, exists: true, title, markdown };
+      if (parsed.includeBlockIds) {
+        result.blockMap = blockLineRanges.map(r => {
+          const block = blocks.get(r.blockId) as Y.Map<any>;
+          return {
+            blockId: r.blockId,
+            startLine: r.startLine,
+            endLine: r.endLine,
+            flavour: block?.get("sys:flavour") || null,
+            type: block?.get("prop:type") || null,
+          };
+        });
       }
-
-      // Clean up: collapse consecutive blank lines into one
-      const collapsed: string[] = [];
-      for (const line of lines) {
-        if (line === "" && collapsed.length > 0 && collapsed[collapsed.length - 1] === "") continue;
-        collapsed.push(line);
-      }
-      while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") collapsed.pop();
-      const markdown = collapsed.join("\n") + "\n";
-
-      return text({ docId: parsed.docId, exists: true, title, markdown });
+      return text(result);
     } finally {
       socket.disconnect();
     }
   };
-  server.registerTool(
-    "read_doc_as_markdown",
-    {
-      title: "Read Document as Markdown",
-      description: "Read a document and return its content as a markdown string. Much more readable than raw blocks.",
-      inputSchema: {
-        workspaceId: WorkspaceId.optional(),
-        docId: DocId,
-      },
+
+  const readDocAsMarkdownMeta = {
+    title: "Read Document as Markdown",
+    description: "Read a document and return its content as a markdown string. Much more readable than raw blocks. Set includeBlockIds=true to get a blockMap array mapping each top-level block to its line range — useful for targeted update_block calls.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      includeBlockIds: z.boolean().optional().describe("If true, includes blockMap array with block IDs and line ranges for each top-level block."),
     },
-    readDocAsMarkdownHandler as any
-  );
+  };
+  server.registerTool("read_doc_as_markdown", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
+  server.registerTool("affine_read_doc_content", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
 
   // ── write_doc_from_markdown ───────────────────────────────────────────
   const mdParser = new MarkdownIt();
