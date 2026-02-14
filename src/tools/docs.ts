@@ -2417,6 +2417,26 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   server.registerTool("delete_blocks", deleteBlocksMeta, deleteBlocksHandler as any);
   server.registerTool("affine_delete_blocks", deleteBlocksMeta, deleteBlocksHandler as any);
 
+  // ── delete_blocks_csv (bulk delete with CSV input) ───────────────────
+  const deleteBlocksCsvHandler = async (parsed: {
+    workspaceId?: string; docId: string; blockIds: string;
+  }) => {
+    const ids = parsed.blockIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
+    return deleteBlocksHandler({ ...parsed, blockIds: ids });
+  };
+
+  const deleteBlocksCsvMeta = {
+    title: "Delete Multiple Blocks (CSV)",
+    description: "Delete multiple blocks using comma-separated block IDs. Alternative to delete_blocks for clients that don't support JSON arrays.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      blockIds: z.string().min(1).describe("Comma-separated block IDs (e.g., 'id1,id2,id3')"),
+    },
+  };
+  server.registerTool("delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler as any);
+  server.registerTool("affine_delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler as any);
+
   // ── move_block (reorder / reparent a block) ───────────────────────────
   const moveBlockHandler = async (parsed: {
     workspaceId?: string; docId: string; blockId: string;
