@@ -573,6 +573,95 @@ describe("integration", () => {
     assert.equal(paraBlock.get("prop:text")?.toString(), "Some content");
   });
 
+  it("delete_block removes block and descendants", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Delete Block Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Add parent list item with a nested child
+    const parentId = genId();
+    const parent = new Y.Map();
+    setSys(parent, parentId, "affine:list");
+    parent.set("sys:parent", noteId);
+    const parentKids = new Y.Array();
+    parent.set("sys:children", parentKids);
+    parent.set("prop:type", "bulleted");
+    parent.set("prop:checked", false);
+    const pt = new Y.Text(); pt.insert(0, "Parent item");
+    parent.set("prop:text", pt);
+    blocks.set(parentId, parent);
+    noteChildren.push([parentId]);
+
+    const childId = genId();
+    const child = new Y.Map();
+    setSys(child, childId, "affine:list");
+    child.set("sys:parent", parentId);
+    child.set("sys:children", new Y.Array());
+    child.set("prop:type", "bulleted");
+    child.set("prop:checked", false);
+    const ct = new Y.Text(); ct.insert(0, "Child item");
+    child.set("prop:text", ct);
+    blocks.set(childId, child);
+    parentKids.push([childId]);
+
+    // Also add a sibling paragraph that should survive
+    const siblingId = genId();
+    const sibling = new Y.Map();
+    setSys(sibling, siblingId, "affine:paragraph");
+    sibling.set("sys:parent", noteId);
+    sibling.set("sys:children", new Y.Array());
+    sibling.set("prop:type", "text");
+    const st = new Y.Text(); st.insert(0, "Survivor");
+    sibling.set("prop:text", st);
+    blocks.set(siblingId, sibling);
+    noteChildren.push([siblingId]);
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Now delete the parent block (should cascade to child)
+    const blocks2 = await readBlocks(socket, docId);
+    const prevSV = Y.encodeStateVector(blocks2.doc!);
+
+    // Remove from note children
+    const noteBlock2 = findByFlavour(blocks2, "affine:note")!;
+    const nc = noteBlock2.get("sys:children") as Y.Array<any>;
+    let delIdx = -1;
+    nc.forEach((id: string, i: number) => { if (id === parentId) delIdx = i; });
+    assert.ok(delIdx >= 0, "parent should be in note children");
+    nc.delete(delIdx, 1);
+
+    // Recursive delete
+    function rmTree(b: Y.Map<any>, bid: string) {
+      const blk = b.get(bid);
+      if (blk instanceof Y.Map) {
+        const kids = blk.get("sys:children");
+        if (kids instanceof Y.Array) kids.forEach((kid: string) => rmTree(b, kid));
+      }
+      b.delete(bid);
+    }
+    rmTree(blocks2, parentId);
+
+    const delta = Y.encodeStateAsUpdate(blocks2.doc!, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Verify: parent and child gone, sibling survives
+    const blocks3 = await readBlocks(socket, docId);
+    assert.equal(blocks3.get(parentId), undefined, "parent should be deleted");
+    assert.equal(blocks3.get(childId), undefined, "child should be cascade deleted");
+    const survivorBlock = blocks3.get(siblingId) as Y.Map<any>;
+    assert.ok(survivorBlock, "sibling should survive");
+    assert.equal(survivorBlock.get("prop:text")?.toString(), "Survivor");
+
+    // Note should have only the sibling
+    const noteBlock3 = findByFlavour(blocks3, "affine:note")!;
+    const finalChildren: string[] = [];
+    (noteBlock3.get("sys:children") as Y.Array<any>).forEach((id: string) => finalChildren.push(id));
+    assert.equal(finalChildren.length, 1);
+    assert.equal(finalChildren[0], siblingId);
+  });
+
   it("special AFFiNE patterns detected in markdown", () => {
     const md = new MarkdownIt();
 

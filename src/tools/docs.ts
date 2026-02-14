@@ -1133,6 +1133,16 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
+  /** Remove a block and all its descendants from the Y.Map */
+  function removeBlockTree(blocks: Y.Map<any>, blockId: string): void {
+    const block = blocks.get(blockId);
+    if (block instanceof Y.Map) {
+      const kids = childIdsFrom(block.get("sys:children"));
+      for (const kid of kids) removeBlockTree(blocks, kid);
+    }
+    blocks.delete(blockId);
+  }
+
   async function appendBlockInternal(parsed: AppendBlockInput) {
     const normalized = normalizeAppendBlockInput(parsed);
     const workspaceId = normalized.workspaceId || defaults.workspaceId;
@@ -1163,7 +1173,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"));
+      await pushDocUpdate(socket, workspaceId, normalized.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${normalized.docId}:`, err.message); throw err; });
       await touchDocMeta(socket, workspaceId, normalized.docId);
 
       return { appended: true, blockId, flavour, blockType, normalizedType: normalized.type, legacyType: normalized.legacyType || null };
@@ -1967,9 +1978,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       // Read current markdown for dry run / diff
       if (parsed.dryRun) {
-        // Re-use the read handler logic to get current markdown
-        const currentResult = await readDocAsMarkdownHandler({ workspaceId, docId: parsed.docId });
-        const currentMd = JSON.parse((currentResult as any).content[0].text).markdown || "";
+        const noteBlock = blocks.get(noteId) as Y.Map<any>;
+        const pageId = findBlockIdByFlavour(blocks, "affine:page");
+        let title = "";
+        if (pageId) {
+          const pageBlock = blocks.get(pageId) as Y.Map<any>;
+          if (pageBlock) title = asText(pageBlock.get("prop:title"));
+        }
+        const { markdown: currentMd } = blocksToMarkdownWithMap(blocks, noteBlock, title);
         return text({ dryRun: true, currentMarkdown: currentMd, newMarkdown: parsed.markdown });
       }
 
@@ -1982,15 +1998,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       // Remove children from note
       if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
       // Remove child blocks recursively
-      function removeBlockTree(blockId: string) {
-        const block = blocks.get(blockId);
-        if (block instanceof Y.Map) {
-          const kids = childIdsFrom(block.get("sys:children"));
-          for (const kid of kids) removeBlockTree(kid);
-        }
-        blocks.delete(blockId);
-      }
-      for (const cid of existingChildIds) removeBlockTree(cid);
+      for (const cid of existingChildIds) removeBlockTree(blocks, cid);
 
       // Parse markdown and create new blocks
       // Strip leading title heading if it matches the doc title (avoid duplication)
@@ -2009,7 +2017,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
       await touchDocMeta(socket, workspaceId, parsed.docId);
 
       return text({ written: true, docId: parsed.docId, blocksCreated: noteChildren.length });
@@ -2208,35 +2217,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     return { markdown: collapsed.join("\n") + "\n", blockLineRanges };
   }
 
-  /** Remove a block and all its descendants from the Y.Map */
-  function removeBlockTree(blocks: Y.Map<any>, blockId: string): void {
-    const block = blocks.get(blockId);
-    if (block instanceof Y.Map) {
-      const kids = childIdsFrom(block.get("sys:children"));
-      for (const kid of kids) removeBlockTree(blocks, kid);
-    }
-    blocks.delete(blockId);
-  }
-
-  /** touchDocMeta using an existing socket (no new connection) */
-  async function touchDocMetaOnSocket(socket: any, workspaceId: string, docId: string): Promise<void> {
-    const wsDoc = new Y.Doc();
-    const snapshot = await loadDoc(socket, workspaceId, workspaceId);
-    if (snapshot.missing) Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
-    const prevSV = Y.encodeStateVector(wsDoc);
-    const wsMeta = wsDoc.getMap("meta");
-    const pages = wsMeta.get("pages") as Y.Array<Y.Map<any>> | undefined;
-    if (pages) {
-      pages.forEach((entry: any) => {
-        if (entry?.get && entry.get("id") === docId) entry.set("updatedDate", Date.now());
-      });
-    }
-    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
-    if (delta.byteLength > 0) {
-      await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(delta).toString("base64"));
-    }
-  }
-
   // ── update_block (edit block text/properties in-place) ────────────────
   const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
 
@@ -2286,8 +2266,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
-      await touchDocMetaOnSocket(socket, workspaceId, parsed.docId);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+      await touchDocMeta(socket, workspaceId, parsed.docId);
 
       return text({ updated: true, blockId: parsed.blockId, flavour });
     } finally {
@@ -2308,6 +2289,67 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   };
   server.registerTool("update_block", updateBlockMeta, updateBlockHandler as any);
   server.registerTool("affine_update_block", updateBlockMeta, updateBlockHandler as any);
+
+  // ── delete_block (remove block + descendants) ─────────────────────────
+  const deleteBlockHandler = async (parsed: {
+    workspaceId?: string; docId: string; blockId: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const block = findBlockById(blocks, parsed.blockId);
+      if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
+
+      const flavour = block.get("sys:flavour") as string;
+      if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot delete structural block (${flavour}).`);
+
+      // Remove from parent's sys:children
+      const parentId = block.get("sys:parent") as string;
+      if (parentId) {
+        const parent = findBlockById(blocks, parentId);
+        if (parent) {
+          const children = ensureChildrenArray(parent);
+          const idx = indexOfChild(children, parsed.blockId);
+          if (idx >= 0) children.delete(idx, 1);
+        }
+      }
+
+      const prevSV = Y.encodeStateVector(doc);
+      removeBlockTree(blocks, parsed.blockId);
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+      await touchDocMeta(socket, workspaceId, parsed.docId);
+
+      return text({ deleted: true, blockId: parsed.blockId, flavour });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const deleteBlockMeta = {
+    title: "Delete Block",
+    description: "Delete a block and all its descendants from a document. Cannot delete structural blocks (page, surface, note).",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("ID of the block to delete"),
+    },
+  };
+  server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler as any);
+  server.registerTool("affine_delete_block", deleteBlockMeta, deleteBlockHandler as any);
 
   const updateDocMarkdownHandler = async (parsed: {
     workspaceId?: string; docId: string;
@@ -2458,10 +2500,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       // 7. Push single CRDT delta
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
 
       // 8. Touch doc meta on same socket
-      await touchDocMetaOnSocket(socket, workspaceId, parsed.docId);
+      await touchDocMeta(socket, workspaceId, parsed.docId);
 
       return text({ patched: true, docId: parsed.docId, blocksRemoved: affectedBlockIds.length, blocksCreated: newBlockIds.length });
     } finally {
@@ -2607,17 +2650,9 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       children.push([noteId]);
 
       if (parsed.content) {
-        const paraId = generateId();
-        const para = new Y.Map();
-        setSysFields(para, paraId, "affine:paragraph");
-        para.set('sys:parent', noteId);
-        para.set('sys:children', new Y.Array());
-        para.set('prop:type', 'text');
-        const ptext = new Y.Text();
-        ptext.insert(0, parsed.content);
-        para.set('prop:text', ptext);
-        blocks.set(paraId, para);
-        noteChildren.push([paraId]);
+        // Parse content as markdown into rich blocks
+        const mdTokens = mdParser.parse(parsed.content, {});
+        markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
       }
 
       const meta = ydoc.getMap('meta');
