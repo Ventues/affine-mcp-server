@@ -279,4 +279,84 @@ export function registerCommentTools(server, gql, defaults) {
             resolved: z.boolean()
         }
     }, resolveCommentHandler);
+    const replyToCommentHandler = async (parsed) => {
+        const mutation = `mutation CreateReply($input: ReplyCreateInput!){ createReply(input: $input){ id content createdAt updatedAt user{ id name avatarUrl } } }`;
+        const normalizedDocMode = (parsed.docMode || 'page').toLowerCase() === 'edgeless' ? 'edgeless' : 'page';
+        let normalizedContent;
+        if (typeof parsed.content === 'string') {
+            const commentBlockId = `comment-${Date.now()}`;
+            normalizedContent = {
+                mode: normalizedDocMode,
+                preview: parsed.content.substring(0, 50),
+                snapshot: {
+                    meta: { id: commentBlockId, tags: [], title: "", createDate: Date.now() },
+                    type: "page",
+                    blocks: {
+                        id: commentBlockId,
+                        type: "block",
+                        flavour: "affine:page",
+                        version: 2,
+                        props: { title: { delta: [], "$blocksuite:internal:text$": true } },
+                        children: [{
+                                id: `note-${Date.now()}`,
+                                type: "block",
+                                flavour: "affine:note",
+                                version: 1,
+                                props: {
+                                    xywh: "[0,0,498,92]",
+                                    index: "a0",
+                                    hidden: false,
+                                    edgeless: {
+                                        style: {
+                                            borderSize: 4,
+                                            shadowType: "--affine-note-shadow-box",
+                                            borderStyle: "none",
+                                            borderRadius: 8
+                                        }
+                                    },
+                                    background: { light: "#ffffff", dark: "#252525" },
+                                    displayMode: "both",
+                                    lockedBySelf: false
+                                },
+                                children: [{
+                                        id: `para-${Date.now()}`,
+                                        type: "block",
+                                        flavour: "affine:paragraph",
+                                        version: 1,
+                                        props: {
+                                            type: "text",
+                                            text: { delta: [{ insert: parsed.content }], "$blocksuite:internal:text$": true },
+                                            collapsed: false
+                                        },
+                                        children: []
+                                    }]
+                            }]
+                    }
+                },
+                attachments: []
+            };
+        }
+        else {
+            normalizedContent = parsed.content;
+        }
+        const data = await gql.request(mutation, {
+            input: {
+                commentId: parsed.commentId,
+                content: normalizedContent,
+                docMode: normalizedDocMode,
+                docTitle: parsed.docTitle || ""
+            }
+        });
+        return text(data.createReply);
+    };
+    server.registerTool("reply_to_comment", {
+        title: "Reply to Comment",
+        description: "Reply to an existing comment.",
+        inputSchema: {
+            commentId: z.string().describe("ID of the comment to reply to"),
+            content: z.any().describe("Reply content (string or structured content)"),
+            docMode: z.enum(["Page", "Edgeless", "page", "edgeless"]).optional(),
+            docTitle: z.string().optional()
+        }
+    }, replyToCommentHandler);
 }
