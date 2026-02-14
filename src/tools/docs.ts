@@ -1545,7 +1545,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   // ── read_doc_as_markdown ──────────────────────────────────────────────
-  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; includeBlockIds?: boolean }) => {
+  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; includeBlockIds?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -1579,9 +1579,27 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         return text({ docId: parsed.docId, exists: true, title, markdown: title ? `# ${title}\n` : "" });
       }
 
-      const { markdown, blockLineRanges } = blocksToMarkdownWithMap(blocks, noteBlock, title);
+      // Determine block subset if pagination/filter requested
+      const allChildIds = childIdsFrom(noteBlock.get("sys:children"));
+      const totalBlocks = allChildIds.length;
+      let selectedIds: string[] | undefined;
 
-      const result: any = { docId: parsed.docId, exists: true, title, markdown };
+      if (parsed.blockIds && parsed.blockIds.length > 0) {
+        const idSet = new Set(parsed.blockIds);
+        selectedIds = allChildIds.filter(id => idSet.has(id));
+      } else if (parsed.blockOffset !== undefined || parsed.blockLimit !== undefined) {
+        const offset = parsed.blockOffset ?? 0;
+        const limit = parsed.blockLimit ?? totalBlocks;
+        selectedIds = allChildIds.slice(offset, offset + limit);
+      }
+
+      const { markdown, blockLineRanges } = blocksToMarkdownWithMap(blocks, noteBlock, selectedIds ? "" : title, selectedIds);
+
+      const result: any = { docId: parsed.docId, exists: true, title, markdown, totalBlocks };
+      if (selectedIds) {
+        result.blockOffset = parsed.blockOffset ?? 0;
+        result.blocksReturned = selectedIds.length;
+      }
       if (parsed.includeBlockIds) {
         result.blockMap = blockLineRanges.map(r => {
           const block = blocks.get(r.blockId) as Y.Map<any>;
@@ -1602,11 +1620,14 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   const readDocAsMarkdownMeta = {
     title: "Read Document as Markdown",
-    description: "Read a document and return its content as a markdown string. Much more readable than raw blocks. Set includeBlockIds=true to get a blockMap array mapping each top-level block to its line range — useful for targeted update_block calls.",
+    description: "Read a document and return its content as a markdown string. Supports pagination with blockOffset/blockLimit to read N blocks at a time, or blockIds to read specific blocks. Set includeBlockIds=true to get a blockMap array mapping each top-level block to its line range.",
     inputSchema: {
       workspaceId: WorkspaceId.optional(),
       docId: DocId,
       includeBlockIds: z.boolean().optional().describe("If true, includes blockMap array with block IDs and line ranges for each top-level block."),
+      blockOffset: z.number().int().min(0).optional().describe("Skip this many blocks from the start (0-based). Use with blockLimit for pagination."),
+      blockLimit: z.number().int().min(1).optional().describe("Max number of blocks to return. Use with blockOffset for pagination."),
+      blockIds: z.array(z.string()).optional().describe("Only return markdown for these specific block IDs."),
     },
   };
   server.registerTool("read_doc_as_markdown", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
@@ -1957,7 +1978,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
-  const writeDocFromMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; markdown: string; dryRun?: boolean }) => {
+  const writeDocFromMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
 
@@ -1991,29 +2012,58 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const prevSV = Y.encodeStateVector(doc);
       const noteBlock = blocks.get(noteId) as Y.Map<any>;
       const noteChildren = ensureChildrenArray(noteBlock);
-
-      // Delete all existing note children (clear doc body)
       const existingChildIds = childIdsFrom(noteChildren);
-      // Remove children from note
-      if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
-      // Remove child blocks recursively
-      for (const cid of existingChildIds) removeBlockTree(blocks, cid);
 
-      // Parse markdown and create new blocks
-      // Strip leading title heading if it matches the doc title (avoid duplication)
+      // Determine which blocks to replace
+      const hasBlockFilter = (parsed.blockIds && parsed.blockIds.length > 0) || parsed.blockOffset !== undefined || parsed.blockLimit !== undefined;
+
+      let replaceStart = 0;
+      let replaceEnd = existingChildIds.length;
+
+      if (parsed.blockIds && parsed.blockIds.length > 0) {
+        const idSet = new Set(parsed.blockIds);
+        const indices = existingChildIds.map((id, i) => idSet.has(id) ? i : -1).filter(i => i >= 0);
+        if (indices.length > 0) {
+          replaceStart = indices[0];
+          replaceEnd = indices[indices.length - 1] + 1;
+        }
+      } else if (hasBlockFilter) {
+        replaceStart = parsed.blockOffset ?? 0;
+        replaceEnd = Math.min(replaceStart + (parsed.blockLimit ?? existingChildIds.length), existingChildIds.length);
+      }
+
+      // Remove the targeted blocks
+      const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
+      if (idsToRemove.length > 0) {
+        noteChildren.delete(replaceStart, idsToRemove.length);
+        for (const cid of idsToRemove) removeBlockTree(blocks, cid);
+      } else if (!hasBlockFilter) {
+        // Full replace — clear everything
+        if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
+        for (const cid of existingChildIds) removeBlockTree(blocks, cid);
+      }
+
+      // Parse markdown and create new blocks into a temp array, then splice in
       let md = parsed.markdown;
-      const pageId = findBlockIdByFlavour(blocks, "affine:page");
-      if (pageId) {
-        const pageBlock = blocks.get(pageId) as Y.Map<any>;
-        const docTitle = asText(pageBlock?.get("prop:title"));
-        if (docTitle) {
-          const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
-          md = md.replace(titlePattern, "");
+      if (!hasBlockFilter) {
+        const pageId = findBlockIdByFlavour(blocks, "affine:page");
+        if (pageId) {
+          const pageBlock = blocks.get(pageId) as Y.Map<any>;
+          const docTitle = asText(pageBlock?.get("prop:title"));
+          if (docTitle) {
+            const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
+            md = md.replace(titlePattern, "");
+          }
         }
       }
 
+      const tempChildren = new Y.Array<string>();
       const mdTokens = mdParser.parse(md, {});
-      markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
+      markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
+
+      // Insert new blocks at the replace position
+      const newIds = tempChildren.toArray();
+      if (newIds.length > 0) noteChildren.insert(replaceStart, newIds);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
       await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
@@ -2030,12 +2080,15 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "write_doc_from_markdown",
     {
       title: "Write Document from Markdown",
-      description: "Replace the entire body of a document with content parsed from a markdown string. Supports headings, paragraphs, lists (bulleted/numbered/todo), code blocks, blockquotes, tables, dividers, latex ($$...$$), images, attachments (📎), and linked docs (affine://). Use dryRun=true to preview changes without writing. Inline formatting (bold, italic, code, links, strikethrough) is preserved.",
+      description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
         markdown: z.string().describe("Markdown content to write into the document body"),
         dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
+        blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
+        blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
+        blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs. The contiguous range from first to last matched block is replaced."),
       },
     },
     writeDocFromMarkdownHandler as any
@@ -2046,7 +2099,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   /** Render blocks to markdown, returning both the markdown string and a map of top-level block IDs to their line ranges */
   function blocksToMarkdownWithMap(
-    blocks: Y.Map<any>, noteBlock: Y.Map<any>, title: string
+    blocks: Y.Map<any>, noteBlock: Y.Map<any>, title: string, selectedChildIds?: string[]
   ): { markdown: string; blockLineRanges: { blockId: string; startLine: number; endLine: number }[] } {
     const lines: string[] = [];
     const blockLineRanges: { blockId: string; startLine: number; endLine: number }[] = [];
@@ -2200,7 +2253,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
     };
 
-    const noteChildIds = childIdsFrom(noteBlock.get("sys:children"));
+    const noteChildIds = selectedChildIds ?? childIdsFrom(noteBlock.get("sys:children"));
     const listIndex: number[] = [];
     let prevWasList = false;
     for (const childId of noteChildIds) {
