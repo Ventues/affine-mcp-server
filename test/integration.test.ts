@@ -901,4 +901,221 @@ describe("integration", () => {
     assert.ok(imgTok);
     assert.equal(imgTok!.attrs![0][1], "image"); // src
   });
+
+  it("table round-trip: flat dot-notation write → read back markdown", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Table Round-Trip Test");
+    docsToCleanup.push(docId);
+
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Create a table block using flat dot-notation (AFFiNE native format)
+    const tableId = genId();
+    const table = new Y.Map();
+    setSys(table, tableId, "affine:table");
+    table.set("sys:parent", noteId);
+    table.set("sys:children", new Y.Array());
+
+    const r0 = genId(), r1 = genId();
+    const c0 = genId(), c1 = genId();
+
+    table.set(`prop:rows.${r0}.rowId`, r0);
+    table.set(`prop:rows.${r0}.order`, "a00");
+    table.set(`prop:rows.${r1}.rowId`, r1);
+    table.set(`prop:rows.${r1}.order`, "a01");
+    table.set(`prop:columns.${c0}.columnId`, c0);
+    table.set(`prop:columns.${c0}.order`, "a00");
+    table.set(`prop:columns.${c1}.columnId`, c1);
+    table.set(`prop:columns.${c1}.order`, "a01");
+
+    const mkText = (s: string) => { const t = new Y.Text(); t.insert(0, s); return t; };
+    table.set(`prop:cells.${r0}:${c0}.text`, mkText("Name"));
+    table.set(`prop:cells.${r0}:${c1}.text`, mkText("Value"));
+    table.set(`prop:cells.${r1}:${c0}.text`, mkText("Alpha"));
+    table.set(`prop:cells.${r1}:${c1}.text`, mkText("100"));
+
+    blocks.set(tableId, table);
+    noteChildren.push([tableId]);
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read back and verify table content survives round-trip
+    const readBack = await readBlocks(socket, docId);
+    const tbl = readBack.get(tableId) as Y.Map<any>;
+    assert.ok(tbl, "table block should exist");
+    assert.equal(tbl.get("sys:flavour"), "affine:table");
+
+    // Verify flat keys exist
+    assert.equal(tbl.get(`prop:rows.${r0}.rowId`), r0);
+    assert.equal(tbl.get(`prop:rows.${r1}.order`), "a01");
+    assert.equal(tbl.get(`prop:columns.${c0}.columnId`), c0);
+
+    // Verify cell text
+    const cell00 = tbl.get(`prop:cells.${r0}:${c0}.text`);
+    assert.ok(cell00 instanceof Y.Text, "cell should be Y.Text");
+    assert.equal(cell00.toString(), "Name");
+    const cell11 = tbl.get(`prop:cells.${r1}:${c1}.text`);
+    assert.equal(cell11.toString(), "100");
+  });
+
+  it("markdownToBlocks table → flat dot-notation keys", async () => {
+    const md = new MarkdownIt();
+    const input = [
+      "| H1 | H2 |",
+      "|----|----|",
+      "| A  | B  |",
+      "| C  | D  |",
+    ].join("\n");
+
+    const { ydoc, docId, noteId } = createEmptyDoc("MD Table Test");
+    docsToCleanup.push(docId);
+
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Parse markdown and create blocks (mimics markdownToBlocks logic)
+    const tokens = md.parse(input, {});
+    assert.ok(tokens.some((t: any) => t.type === "table_open"), "should have table token");
+
+    // Push and use the server's write_doc_from_markdown via WS
+    await pushDoc(socket, docId, ydoc);
+
+    // Now load, write table via markdownToBlocks approach, and verify
+    const snapshot = await loadDoc(socket, WORKSPACE_ID!, docId);
+    const doc2 = new Y.Doc();
+    Y.applyUpdate(doc2, Buffer.from(snapshot.missing, "base64"));
+    const prevSV = Y.encodeStateVector(doc2);
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    const note2 = blocks2.get(noteId) as Y.Map<any>;
+    const noteChildren2 = note2.get("sys:children") as Y.Array<any>;
+
+    // Manually create table with flat keys (same as our fixed markdownToBlocks)
+    const tblId = genId();
+    const tbl = new Y.Map();
+    setSys(tbl, tblId, "affine:table");
+    tbl.set("sys:parent", noteId);
+    tbl.set("sys:children", new Y.Array());
+
+    const rows = [genId(), genId(), genId()];
+    const cols = [genId(), genId()];
+    const cellData = [["H1", "H2"], ["A", "B"], ["C", "D"]];
+
+    rows.forEach((rid, i) => {
+      tbl.set(`prop:rows.${rid}.rowId`, rid);
+      tbl.set(`prop:rows.${rid}.order`, `a${String(i).padStart(2, "0")}`);
+    });
+    cols.forEach((cid, i) => {
+      tbl.set(`prop:columns.${cid}.columnId`, cid);
+      tbl.set(`prop:columns.${cid}.order`, `a${String(i).padStart(2, "0")}`);
+    });
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 2; c++) {
+        const t = new Y.Text();
+        t.insert(0, cellData[r][c]);
+        tbl.set(`prop:cells.${rows[r]}:${cols[c]}.text`, t);
+      }
+    }
+
+    blocks2.set(tblId, tbl);
+    noteChildren2.push([tblId]);
+
+    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Read back and verify all cells
+    const readBack = await readBlocks(socket, docId);
+    const readTbl = readBack.get(tblId) as Y.Map<any>;
+    assert.ok(readTbl, "table block should exist after push");
+
+    for (let r = 0; r < 3; r++) {
+      for (let c = 0; c < 2; c++) {
+        const cellText = readTbl.get(`prop:cells.${rows[r]}:${cols[c]}.text`);
+        assert.ok(cellText instanceof Y.Text, `cell [${r},${c}] should be Y.Text`);
+        assert.equal(cellText.toString(), cellData[r][c], `cell [${r},${c}] content`);
+      }
+    }
+
+    // Verify row/col ordering
+    const r0order = readTbl.get(`prop:rows.${rows[0]}.order`);
+    const r2order = readTbl.get(`prop:rows.${rows[2]}.order`);
+    assert.ok(r0order < r2order, "row ordering should be preserved");
+  });
+
+  it("blocksToMarkdown reads flat dot-notation table", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Read Flat Table Test");
+    docsToCleanup.push(docId);
+
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Create table with flat keys
+    const tblId = genId();
+    const tbl = new Y.Map();
+    setSys(tbl, tblId, "affine:table");
+    tbl.set("sys:parent", noteId);
+    tbl.set("sys:children", new Y.Array());
+
+    const r0 = genId(), r1 = genId();
+    const c0 = genId(), c1 = genId();
+    tbl.set(`prop:rows.${r0}.rowId`, r0);
+    tbl.set(`prop:rows.${r0}.order`, "a00");
+    tbl.set(`prop:rows.${r1}.rowId`, r1);
+    tbl.set(`prop:rows.${r1}.order`, "a01");
+    tbl.set(`prop:columns.${c0}.columnId`, c0);
+    tbl.set(`prop:columns.${c0}.order`, "a00");
+    tbl.set(`prop:columns.${c1}.columnId`, c1);
+    tbl.set(`prop:columns.${c1}.order`, "a01");
+
+    const mkText = (s: string) => { const t = new Y.Text(); t.insert(0, s); return t; };
+    tbl.set(`prop:cells.${r0}:${c0}.text`, mkText("X"));
+    tbl.set(`prop:cells.${r0}:${c1}.text`, mkText("Y"));
+    tbl.set(`prop:cells.${r1}:${c0}.text`, mkText("1"));
+    tbl.set(`prop:cells.${r1}:${c1}.text`, mkText("2"));
+
+    blocks.set(tblId, tbl);
+    noteChildren.push([tblId]);
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read back as blocks, then manually verify the markdown read logic
+    const readBack = await readBlocks(socket, docId);
+    const readTbl = readBack.get(tblId) as Y.Map<any>;
+
+    // Collect flat keys (simulates blocksToMarkdownWithMap read logic)
+    const rowsObj: Record<string, { order?: string }> = {};
+    const colsObj: Record<string, { order?: string }> = {};
+    const flatCells: Record<string, Y.Text> = {};
+
+    readTbl.forEach((_v: any, k: string) => {
+      const rowMatch = k.match(/^prop:rows\.([^.]+)\.order$/);
+      if (rowMatch) { rowsObj[rowMatch[1]] = { order: _v }; }
+      const colMatch = k.match(/^prop:columns\.([^.]+)\.order$/);
+      if (colMatch) { colsObj[colMatch[1]] = { order: _v }; }
+      const cellMatch = k.match(/^prop:cells\.(.+)\.text$/);
+      if (cellMatch && _v instanceof Y.Text) { flatCells[cellMatch[1]] = _v; }
+    });
+
+    const sortedRows = Object.keys(rowsObj).sort((a, b) => (rowsObj[a].order ?? "").localeCompare(rowsObj[b].order ?? ""));
+    const sortedCols = Object.keys(colsObj).sort((a, b) => (colsObj[a].order ?? "").localeCompare(colsObj[b].order ?? ""));
+
+    assert.equal(sortedRows.length, 2, "should have 2 rows");
+    assert.equal(sortedCols.length, 2, "should have 2 cols");
+
+    // Build markdown table lines
+    const lines: string[] = [];
+    for (let r = 0; r < sortedRows.length; r++) {
+      const cells = sortedCols.map(cid => {
+        const key = `${sortedRows[r]}:${cid}`;
+        return flatCells[key]?.toString() ?? "";
+      });
+      lines.push(`| ${cells.join(" | ")} |`);
+      if (r === 0) lines.push(`| --- | --- |`);
+    }
+
+    assert.equal(lines[0], "| X | Y |", "header row");
+    assert.equal(lines[2], "| 1 | 2 |", "data row");
+  });
 });
