@@ -807,27 +807,29 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         setSysFields(block, blockId, "affine:table");
         block.set("sys:parent", parentId);
         block.set("sys:children", new Y.Array<string>());
-        const rows: Record<string, { rowId: string; order: string; backgroundColor?: string }> = {};
-        const columns: Record<string, { columnId: string; order: string; backgroundColor?: string; width?: number }> = {};
-        const cells: Record<string, { text: Y.Text }> = {};
+        const rowsMap = new Y.Map<any>();
+        const columnsMap = new Y.Map<any>();
+        const cellsMap = new Y.Map<any>();
 
         for (let i = 0; i < normalized.rows; i++) {
           const rowId = generateId();
-          rows[rowId] = { rowId, order: `r${String(i).padStart(4, "0")}` };
+          rowsMap.set(rowId, { rowId, order: `r${String(i).padStart(4, "0")}` });
         }
         for (let i = 0; i < normalized.columns; i++) {
           const columnId = generateId();
-          columns[columnId] = { columnId, order: `c${String(i).padStart(4, "0")}` };
+          columnsMap.set(columnId, { columnId, order: `c${String(i).padStart(4, "0")}` });
         }
-        for (const rowId of Object.keys(rows)) {
-          for (const columnId of Object.keys(columns)) {
-            cells[`${rowId}:${columnId}`] = { text: makeText("") };
+        for (const rowId of Array.from(rowsMap.keys())) {
+          for (const columnId of Array.from(columnsMap.keys())) {
+            const cellMap = new Y.Map<any>();
+            cellMap.set("text", makeText(""));
+            cellsMap.set(`${rowId}:${columnId}`, cellMap);
           }
         }
 
-        block.set("prop:rows", rows);
-        block.set("prop:columns", columns);
-        block.set("prop:cells", cells);
+        block.set("prop:rows", rowsMap);
+        block.set("prop:columns", columnsMap);
+        block.set("prop:cells", cellsMap);
         block.set("prop:comments", undefined);
         block.set("prop:textAlign", undefined);
         return { blockId, block, flavour: "affine:table" };
@@ -1922,32 +1924,34 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         const nRows = tableRows.length;
         const nCols = nRows > 0 ? Math.max(...tableRows.map(r => r.length)) : 1;
 
-        // Build AFFiNE table block
+        // Build AFFiNE table block with Y.Map instances for CRDT persistence
         const rowIds: string[] = [];
         const colIds: string[] = [];
-        const rows: Record<string, any> = {};
-        const columns: Record<string, any> = {};
-        const cells: Record<string, any> = {};
+        const rowsMap = new Y.Map<any>();
+        const columnsMap = new Y.Map<any>();
+        const cellsMap = new Y.Map<any>();
 
         for (let r = 0; r < nRows; r++) {
           const rid = generateId();
           rowIds.push(rid);
-          rows[rid] = { rowId: rid, order: `r${String(r).padStart(4, "0")}` };
+          rowsMap.set(rid, { rowId: rid, order: `r${String(r).padStart(4, "0")}` });
         }
         for (let c = 0; c < nCols; c++) {
           const cid = generateId();
           colIds.push(cid);
-          columns[cid] = { columnId: cid, order: `c${String(c).padStart(4, "0")}` };
+          columnsMap.set(cid, { columnId: cid, order: `c${String(c).padStart(4, "0")}` });
         }
         for (let r = 0; r < nRows; r++) {
           for (let c = 0; c < nCols; c++) {
             const cellChildren = tableRows[r]?.[c] || [];
-            cells[`${rowIds[r]}:${colIds[c]}`] = { text: makeRichText(cellChildren) };
+            const cellMap = new Y.Map<any>();
+            cellMap.set("text", makeRichText(cellChildren));
+            cellsMap.set(`${rowIds[r]}:${colIds[c]}`, cellMap);
           }
         }
 
         addBlock(noteId, noteChildren, "affine:table", {
-          "prop:rows": rows, "prop:columns": columns, "prop:cells": cells,
+          "prop:rows": rowsMap, "prop:columns": columnsMap, "prop:cells": cellsMap,
           "prop:comments": undefined, "prop:textAlign": undefined,
         });
         continue;
@@ -2113,7 +2117,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
               }
               const obj = toObj(cellsRaw) as Record<string, any>;
               const c = obj[key];
-              if (c && typeof c === "object" && "text" in c) return String(c.text ?? "");
+              if (c && typeof c === "object" && "text" in c) return richTextToMarkdown(c.text);
               return "";
             };
             for (let r = 0; r < sortedRowIds.length; r++) {
