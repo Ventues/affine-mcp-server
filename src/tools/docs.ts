@@ -2184,6 +2184,209 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   // ── update_doc_markdown (str_replace style partial update) ────────────
+  // Optimized: single WS connection, single doc load, surgical block update.
+
+  /** Render blocks to markdown, returning both the markdown string and a map of top-level block IDs to their line ranges */
+  function blocksToMarkdownWithMap(
+    blocks: Y.Map<any>, noteBlock: Y.Map<any>, title: string
+  ): { markdown: string; blockLineRanges: { blockId: string; startLine: number; endLine: number }[] } {
+    const lines: string[] = [];
+    const blockLineRanges: { blockId: string; startLine: number; endLine: number }[] = [];
+    if (title) lines.push(`# ${title}`, "");
+
+    const renderBlock = (blockId: string, depth: number, listIndex: number[]): void => {
+      const raw = blocks.get(blockId);
+      if (!(raw instanceof Y.Map)) return;
+      const flavour = raw.get("sys:flavour") as string;
+      const type = raw.get("prop:type") as string | undefined;
+      const blockText = richTextToMarkdown(raw.get("prop:text"));
+      const childIds = childIdsFrom(raw.get("sys:children"));
+      const indent = "  ".repeat(depth);
+
+      switch (flavour) {
+        case "affine:paragraph": {
+          if (type && type.startsWith("h") && type.length === 2) {
+            const level = parseInt(type[1], 10);
+            if (level >= 1 && level <= 6) { lines.push(`${indent}${"#".repeat(level)} ${blockText}`, ""); break; }
+          }
+          if (type === "quote") { lines.push(`${indent}> ${blockText}`, ""); }
+          else { if (blockText) lines.push(`${indent}${blockText}`, ""); }
+          for (const cid of childIds) renderBlock(cid, depth, []);
+          break;
+        }
+        case "affine:list": {
+          const checked = raw.get("prop:checked");
+          let prefix: string;
+          let listText = blockText;
+          if (type === "todo") { prefix = checked ? "- [x]" : "- [ ]"; }
+          else if (type === "numbered") {
+            const num = (listIndex[depth] ?? 0) + 1;
+            listIndex[depth] = num;
+            prefix = `${num}.`;
+            listText = listText.replace(/^\d+\.\s*/, "");
+          } else { prefix = "-"; }
+          lines.push(`${indent}${prefix} ${listText}`);
+          for (const cid of childIds) renderBlock(cid, depth + 1, listIndex);
+          break;
+        }
+        case "affine:code": {
+          const lang = raw.get("prop:language") || "";
+          lines.push(`${indent}\`\`\`${lang}`, blockText, `${indent}\`\`\``, "");
+          break;
+        }
+        case "affine:divider": { lines.push("---", ""); break; }
+        case "affine:table": {
+          const rowsRaw = raw.get("prop:rows");
+          const colsRaw = raw.get("prop:columns");
+          const cellsRaw = raw.get("prop:cells");
+          const toObj = (v: unknown) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
+          const rowsObj = rowsRaw ? toObj(rowsRaw) as Record<string, { order?: string }> : {};
+          const colsObj = colsRaw ? toObj(colsRaw) as Record<string, { order?: string }> : {};
+          const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
+          const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
+          if (sortedRowIds.length > 0 && sortedColIds.length > 0 && cellsRaw) {
+            const readCell = (rowId: string, colId: string): string => {
+              const key = `${rowId}:${colId}`;
+              if (cellsRaw instanceof Y.Map) {
+                const cell = cellsRaw.get(key);
+                if (cell instanceof Y.Map) return richTextToMarkdown(cell.get("text"));
+                if (cell instanceof Y.Text) return richTextToMarkdown(cell);
+              }
+              const obj = toObj(cellsRaw) as Record<string, any>;
+              const c = obj[key];
+              if (c && typeof c === "object" && "text" in c) return String(c.text ?? "");
+              return "";
+            };
+            for (let r = 0; r < sortedRowIds.length; r++) {
+              const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
+              lines.push(`| ${cells.join(" | ")} |`);
+              if (r === 0) lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
+            }
+            lines.push("");
+          } else {
+            const nRows = Math.max(sortedRowIds.length, 1);
+            const nCols = Math.max(sortedColIds.length, 1);
+            const emptyRow = `|${" |".repeat(nCols)}`;
+            lines.push(emptyRow);
+            lines.push(`|${" --- |".repeat(nCols)}`);
+            for (let r = 1; r < nRows; r++) lines.push(emptyRow);
+            lines.push("");
+          }
+          break;
+        }
+        case "affine:latex": {
+          const latex = raw.get("prop:latex") || "";
+          if (latex) lines.push(`${indent}$$${latex}$$`, "");
+          break;
+        }
+        case "affine:image": {
+          const caption = raw.get("prop:caption") || "";
+          lines.push(`${indent}![${caption}](image)`, "");
+          break;
+        }
+        case "affine:attachment": {
+          const name = raw.get("prop:name") || "attachment";
+          lines.push(`${indent}📎 ${name}`, "");
+          break;
+        }
+        case "affine:database": {
+          const dbTitle = asText(raw.get("prop:title")) || blockText;
+          if (dbTitle) lines.push(`${indent}**${dbTitle}**`, "");
+          for (const cid of childIds) renderBlock(cid, depth, []);
+          if (!dbTitle && childIds.length === 0) lines.push("*(database)*", "");
+          break;
+        }
+        case "affine:bookmark": {
+          const url = raw.get("prop:url") || "";
+          const bmTitle = raw.get("prop:title") || url;
+          lines.push(`[${bmTitle}](${url})`, "");
+          break;
+        }
+        case "affine:embed-linked-doc": {
+          const pid = raw.get("prop:pageId") || "";
+          const docTitle = raw.get("prop:title") || "Linked Doc";
+          lines.push(`[${docTitle}](affine://${pid})`, "");
+          break;
+        }
+        default: {
+          if (blockText) lines.push(blockText, "");
+          break;
+        }
+      }
+    };
+
+    const noteChildIds = childIdsFrom(noteBlock.get("sys:children"));
+    const listIndex: number[] = [];
+    let prevWasList = false;
+    for (const childId of noteChildIds) {
+      const raw = blocks.get(childId);
+      const isList = raw instanceof Y.Map && raw.get("sys:flavour") === "affine:list";
+      if (!isList) {
+        if (prevWasList) lines.push("");
+        listIndex.length = 0;
+      }
+      const startLine = lines.length;
+      renderBlock(childId, 0, listIndex);
+      blockLineRanges.push({ blockId: childId, startLine, endLine: lines.length });
+      prevWasList = isList;
+    }
+
+    // Collapse consecutive blank lines
+    const collapsed: string[] = [];
+    // Map from collapsed line index → original line index
+    const collapseMap: number[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lines[i] === "" && collapsed.length > 0 && collapsed[collapsed.length - 1] === "") continue;
+      collapsed.push(lines[i]);
+      collapseMap.push(i);
+    }
+    while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") { collapsed.pop(); collapseMap.pop(); }
+
+    // Remap blockLineRanges to collapsed line numbers
+    // Build reverse map: original line → collapsed line
+    const reverseMap = new Array(lines.length).fill(-1);
+    for (let ci = 0; ci < collapseMap.length; ci++) reverseMap[collapseMap[ci]] = ci;
+    // For lines that were collapsed away, map to the next valid collapsed line
+    for (let i = lines.length - 1; i >= 0; i--) {
+      if (reverseMap[i] === -1) reverseMap[i] = i + 1 < lines.length ? reverseMap[i + 1] : collapseMap.length;
+    }
+    for (const range of blockLineRanges) {
+      range.startLine = reverseMap[range.startLine] ?? range.startLine;
+      range.endLine = reverseMap[range.endLine] !== undefined ? reverseMap[range.endLine] : range.endLine;
+    }
+
+    return { markdown: collapsed.join("\n") + "\n", blockLineRanges };
+  }
+
+  /** Remove a block and all its descendants from the Y.Map */
+  function removeBlockTree(blocks: Y.Map<any>, blockId: string): void {
+    const block = blocks.get(blockId);
+    if (block instanceof Y.Map) {
+      const kids = childIdsFrom(block.get("sys:children"));
+      for (const kid of kids) removeBlockTree(blocks, kid);
+    }
+    blocks.delete(blockId);
+  }
+
+  /** touchDocMeta using an existing socket (no new connection) */
+  async function touchDocMetaOnSocket(socket: any, workspaceId: string, docId: string): Promise<void> {
+    const wsDoc = new Y.Doc();
+    const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+    if (snapshot.missing) Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+    const prevSV = Y.encodeStateVector(wsDoc);
+    const wsMeta = wsDoc.getMap("meta");
+    const pages = wsMeta.get("pages") as Y.Array<Y.Map<any>> | undefined;
+    if (pages) {
+      pages.forEach((entry: any) => {
+        if (entry?.get && entry.get("id") === docId) entry.set("updatedDate", Date.now());
+      });
+    }
+    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+    if (delta.byteLength > 0) {
+      await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(delta).toString("base64"));
+    }
+  }
+
   const updateDocMarkdownHandler = async (parsed: {
     workspaceId?: string; docId: string;
     old_markdown: string; new_markdown: string; dryRun?: boolean;
@@ -2191,20 +2394,157 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
 
-    const readResult = await readDocAsMarkdownHandler({ workspaceId, docId: parsed.docId });
-    const currentMd = JSON.parse((readResult as any).content[0].text).markdown || "";
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
 
-    const idx = currentMd.indexOf(parsed.old_markdown);
-    if (idx === -1) throw new Error("old_markdown not found in document. Make sure it matches the exact text from read_doc_as_markdown.");
-    if (currentMd.indexOf(parsed.old_markdown, idx + 1) !== -1)
-      throw new Error("old_markdown matches multiple locations in the document. Include more surrounding text to make it unique.");
+      // 1. Load doc ONCE
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const noteId = findBlockIdByFlavour(blocks, "affine:note");
+      if (!noteId) throw new Error("Document has no note block.");
+      const noteBlock = blocks.get(noteId) as Y.Map<any>;
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      let title = "";
+      if (pageId) {
+        const pageBlock = blocks.get(pageId) as Y.Map<any>;
+        if (pageBlock) title = asText(pageBlock.get("prop:title"));
+      }
 
-    const newMd = currentMd.slice(0, idx) + parsed.new_markdown + currentMd.slice(idx + parsed.old_markdown.length);
+      // 2. Render to markdown WITH block-line mapping
+      const { markdown: currentMd, blockLineRanges } = blocksToMarkdownWithMap(blocks, noteBlock, title);
 
-    if (parsed.dryRun) return text({ dryRun: true, currentMarkdown: currentMd, patchedMarkdown: newMd });
+      // 3. str_replace validation
+      const idx = currentMd.indexOf(parsed.old_markdown);
+      if (idx === -1) throw new Error("old_markdown not found in document. Make sure it matches the exact text from read_doc_as_markdown.");
+      if (currentMd.indexOf(parsed.old_markdown, idx + 1) !== -1)
+        throw new Error("old_markdown matches multiple locations in the document. Include more surrounding text to make it unique.");
 
-    await writeDocFromMarkdownHandler({ workspaceId, docId: parsed.docId, markdown: newMd });
-    return text({ patched: true, docId: parsed.docId });
+      const newMd = currentMd.slice(0, idx) + parsed.new_markdown + currentMd.slice(idx + parsed.old_markdown.length);
+
+      if (parsed.dryRun) return text({ dryRun: true, currentMarkdown: currentMd, patchedMarkdown: newMd });
+
+      // 4. Find which top-level blocks are affected by the change
+      const mdLines = currentMd.split("\n");
+      // Convert char offset to line number
+      let charCount = 0;
+      let changeStartLine = 0;
+      for (let i = 0; i < mdLines.length; i++) {
+        if (charCount + mdLines[i].length >= idx) { changeStartLine = i; break; }
+        charCount += mdLines[i].length + 1; // +1 for \n
+      }
+      const changeEndOffset = idx + parsed.old_markdown.length;
+      charCount = 0;
+      let changeEndLine = mdLines.length;
+      for (let i = 0; i < mdLines.length; i++) {
+        charCount += mdLines[i].length + 1;
+        if (charCount >= changeEndOffset) { changeEndLine = i + 1; break; }
+      }
+
+      // Find affected top-level block IDs (those whose line ranges overlap the change)
+      const affectedBlockIds: string[] = [];
+      let firstAffectedIdx = -1;
+      let lastAffectedIdx = -1;
+      for (let i = 0; i < blockLineRanges.length; i++) {
+        const r = blockLineRanges[i];
+        if (r.endLine > changeStartLine && r.startLine < changeEndLine) {
+          affectedBlockIds.push(r.blockId);
+          if (firstAffectedIdx === -1) firstAffectedIdx = i;
+          lastAffectedIdx = i;
+        }
+      }
+
+      if (affectedBlockIds.length === 0) {
+        // Edge case: change is in title or whitespace only — fall back to full rewrite
+        firstAffectedIdx = 0;
+        lastAffectedIdx = blockLineRanges.length - 1;
+        for (const r of blockLineRanges) affectedBlockIds.push(r.blockId);
+      }
+
+      // 5. Extract the new markdown for just the affected region
+      // Before affected = lines before first affected block
+      // After affected = lines after last affected block
+      const beforeLines = firstAffectedIdx > 0 ? blockLineRanges[firstAffectedIdx].startLine : (title ? 2 : 0);
+      const afterStartLine = lastAffectedIdx < blockLineRanges.length - 1
+        ? blockLineRanges[lastAffectedIdx].endLine
+        : mdLines.length;
+
+      const newMdLines = newMd.split("\n");
+      // The lines before the affected region are the same count
+      // The lines after the affected region start at (newMdLines.length - (mdLines.length - afterStartLine))
+      const afterLinesCount = mdLines.length - afterStartLine;
+      const newRegionEnd = newMdLines.length - afterLinesCount;
+      const newRegionMd = newMdLines.slice(beforeLines, newRegionEnd).join("\n");
+
+      // 6. Surgical update: remove affected blocks, parse new region, insert at position
+      const prevSV = Y.encodeStateVector(doc);
+      const noteChildren = ensureChildrenArray(noteBlock);
+
+      // Find insertion index in noteChildren
+      let insertIdx = 0;
+      if (firstAffectedIdx > 0) {
+        // Insert after the block before the first affected
+        const prevBlockId = blockLineRanges[firstAffectedIdx - 1].blockId;
+        const prevIdx = indexOfChild(noteChildren, prevBlockId);
+        insertIdx = prevIdx >= 0 ? prevIdx + 1 : 0;
+      }
+
+      // Remove affected blocks from noteChildren and blocks map
+      for (const bid of affectedBlockIds) {
+        const childIdx = indexOfChild(noteChildren, bid);
+        if (childIdx >= 0) noteChildren.delete(childIdx, 1);
+        removeBlockTree(blocks, bid);
+      }
+
+      // Parse the new region markdown and insert blocks at the right position
+      // Strip title if it appears at the start of the region
+      let regionMd = newRegionMd;
+      if (title) {
+        const titlePattern = new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
+        regionMd = regionMd.replace(titlePattern, "");
+      }
+
+      // Create a temporary note to collect new blocks, then splice them into the real note
+      const tempNoteId = generateId();
+      const tempNote = new Y.Map<any>();
+      setSysFields(tempNote, tempNoteId, "affine:note");
+      const tempChildren = new Y.Array<string>();
+      tempNote.set("sys:children", tempChildren);
+      blocks.set(tempNoteId, tempNote);
+
+      const mdTokens = mdParser.parse(regionMd, {});
+      markdownToBlocks(mdTokens, tempNoteId, blocks, tempChildren);
+
+      // Move new blocks from temp note to real note at insertIdx
+      const newBlockIds: string[] = childIdsFrom(tempChildren);
+      for (let i = 0; i < newBlockIds.length; i++) {
+        const bid = newBlockIds[i];
+        // Update parent reference
+        const block = blocks.get(bid);
+        if (block instanceof Y.Map) block.set("sys:parent", noteId);
+        noteChildren.insert(insertIdx + i, [bid]);
+      }
+
+      // Clean up temp note
+      tempChildren.delete(0, tempChildren.length);
+      blocks.delete(tempNoteId);
+
+      // 7. Push single CRDT delta
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+
+      // 8. Touch doc meta on same socket
+      await touchDocMetaOnSocket(socket, workspaceId, parsed.docId);
+
+      return text({ patched: true, docId: parsed.docId, blocksRemoved: affectedBlockIds.length, blocksCreated: newBlockIds.length });
+    } finally {
+      socket.disconnect();
+    }
   };
 
   const updateDocMarkdownMeta = {
