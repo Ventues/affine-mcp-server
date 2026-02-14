@@ -528,6 +528,51 @@ describe("integration", () => {
     }
   });
 
+  it("read_doc_as_markdown includeBlockIds flag", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("BlockMap Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Add a heading and a paragraph
+    function addBlock(text: string, type: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, "affine:paragraph");
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      b.set("prop:type", type);
+      const yt = new Y.Text();
+      yt.insert(0, text);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+      return id;
+    }
+    const h2Id = addBlock("My Heading", "h2");
+    const paraId = addBlock("Some content", "text");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read back and verify block IDs and types are trackable
+    const blocks2 = await readBlocks(socket, docId);
+    const noteBlock = findByFlavour(blocks2, "affine:note")!;
+    const childIds: string[] = [];
+    (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+    assert.equal(childIds.length, 2);
+    assert.equal(childIds[0], h2Id);
+    assert.equal(childIds[1], paraId);
+
+    const h2Block = blocks2.get(h2Id) as Y.Map<any>;
+    assert.equal(h2Block.get("prop:type"), "h2");
+    assert.equal(h2Block.get("prop:text")?.toString(), "My Heading");
+
+    const paraBlock = blocks2.get(paraId) as Y.Map<any>;
+    assert.equal(paraBlock.get("prop:type"), "text");
+    assert.equal(paraBlock.get("prop:text")?.toString(), "Some content");
+  });
+
   it("special AFFiNE patterns detected in markdown", () => {
     const md = new MarkdownIt();
 
