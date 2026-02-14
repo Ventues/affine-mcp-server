@@ -662,6 +662,158 @@ describe("integration", () => {
     assert.equal(finalChildren[0], siblingId);
   });
 
+  it("update_doc_markdown char offset logic", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Offset Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Add 3 paragraphs: A, B, C
+    function addPara(text: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, "affine:paragraph");
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      b.set("prop:type", "text");
+      const yt = new Y.Text(); yt.insert(0, text);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+      return id;
+    }
+    const aId = addPara("Block A");
+    const bId = addPara("Block B");
+    const cId = addPara("Block C");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Simulate update_doc_markdown: change only "Block B" → "Block B Updated"
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+
+    // Verify only block B is affected
+    const prevSV = Y.encodeStateVector(doc2);
+    const bBlock = blocks2.get(bId) as Y.Map<any>;
+    const bText = bBlock.get("prop:text") as Y.Text;
+    bText.delete(0, bText.length);
+    bText.insert(0, "Block B Updated");
+
+    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Read back and verify A and C unchanged, B updated
+    const blocks3 = await readBlocks(socket, docId);
+    const aBlock3 = blocks3.get(aId) as Y.Map<any>;
+    const bBlock3 = blocks3.get(bId) as Y.Map<any>;
+    const cBlock3 = blocks3.get(cId) as Y.Map<any>;
+
+    assert.equal(aBlock3.get("prop:text")?.toString(), "Block A", "A should be unchanged");
+    assert.equal(bBlock3.get("prop:text")?.toString(), "Block B Updated", "B should be updated");
+    assert.equal(cBlock3.get("prop:text")?.toString(), "Block C", "C should be unchanged");
+
+    // Verify block IDs are preserved (surgical update, not full rewrite)
+    const noteBlock3 = findByFlavour(blocks3, "affine:note")!;
+    const childIds3: string[] = [];
+    (noteBlock3.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds3.push(id));
+    assert.deepEqual(childIds3, [aId, bId, cId], "block IDs should be preserved");
+  });
+
+  it("move_block reorders and reparents blocks", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Move Block Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    function addPara(txt: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, "affine:paragraph");
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      b.set("prop:type", "text");
+      const yt = new Y.Text(); yt.insert(0, txt);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+      return id;
+    }
+    const aId = addPara("A");
+    const bId = addPara("B");
+    const cId = addPara("C");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Move C before A (reorder within same parent)
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+
+    // Remove C from old position
+    const note2 = blocks2.get(noteId) as Y.Map<any>;
+    const nc2 = note2.get("sys:children") as Y.Array<any>;
+    let cIdx = -1;
+    nc2.forEach((id: string, i: number) => { if (id === cId) cIdx = i; });
+    nc2.delete(cIdx, 1);
+
+    // Insert C at index 0 (before A)
+    const prevSV = Y.encodeStateVector(doc2);
+    nc2.insert(0, [cId]);
+
+    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Verify order is now C, A, B
+    const blocks3 = await readBlocks(socket, docId);
+    const note3 = findByFlavour(blocks3, "affine:note")!;
+    const finalIds: string[] = [];
+    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => finalIds.push(id));
+    assert.deepEqual(finalIds, [cId, aId, bId], "order should be C, A, B");
+  });
+
+  it("update_doc_title renames a document", async () => {
+    const { ydoc, docId } = createEmptyDoc("Old Title");
+    docsToCleanup.push(docId);
+    await pushDoc(socket, docId, ydoc);
+
+    // Update title
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+
+    let pageId = "";
+    blocks2.forEach((_v: any, k: string) => {
+      const b = blocks2.get(k) as Y.Map<any>;
+      if (b.get("sys:flavour") === "affine:page") pageId = k;
+    });
+    assert.ok(pageId, "should have a page block");
+
+    const pageBlock = blocks2.get(pageId) as Y.Map<any>;
+    const prevSV = Y.encodeStateVector(doc2);
+    const titleYText = pageBlock.get("prop:title") as Y.Text;
+    titleYText.delete(0, titleYText.length);
+    titleYText.insert(0, "New Title");
+
+    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Verify title changed
+    const blocks3 = await readBlocks(socket, docId);
+    let pageId3 = "";
+    blocks3.forEach((_v: any, k: string) => {
+      const b = blocks3.get(k) as Y.Map<any>;
+      if (b.get("sys:flavour") === "affine:page") pageId3 = k;
+    });
+    const page3 = blocks3.get(pageId3) as Y.Map<any>;
+    assert.equal(page3.get("prop:title")?.toString(), "New Title");
+  });
+
   it("special AFFiNE patterns detected in markdown", () => {
     const md = new MarkdownIt();
 

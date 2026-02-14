@@ -2351,6 +2351,179 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler as any);
   server.registerTool("affine_delete_block", deleteBlockMeta, deleteBlockHandler as any);
 
+  // ── move_block (reorder / reparent a block) ───────────────────────────
+  const moveBlockHandler = async (parsed: {
+    workspaceId?: string; docId: string; blockId: string;
+    placement: { parentId?: string; afterBlockId?: string; beforeBlockId?: string; index?: number };
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const block = findBlockById(blocks, parsed.blockId);
+      if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
+
+      const flavour = block.get("sys:flavour") as string;
+      if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot move structural block (${flavour}).`);
+
+      // Remove from old parent
+      const oldParentId = block.get("sys:parent") as string;
+      if (oldParentId) {
+        const oldParent = findBlockById(blocks, oldParentId);
+        if (oldParent) {
+          const oldChildren = ensureChildrenArray(oldParent);
+          const idx = indexOfChild(oldChildren, parsed.blockId);
+          if (idx >= 0) oldChildren.delete(idx, 1);
+        }
+      }
+
+      // Resolve new parent + position
+      const pl = parsed.placement;
+      let newParentId: string;
+      let insertIdx: number;
+
+      if (pl.afterBlockId) {
+        const ref = findBlockById(blocks, pl.afterBlockId);
+        if (!ref) throw new Error(`placement.afterBlockId '${pl.afterBlockId}' not found.`);
+        newParentId = ref.get("sys:parent") as string;
+        const children = ensureChildrenArray(findBlockById(blocks, newParentId)!);
+        insertIdx = indexOfChild(children, pl.afterBlockId) + 1;
+      } else if (pl.beforeBlockId) {
+        const ref = findBlockById(blocks, pl.beforeBlockId);
+        if (!ref) throw new Error(`placement.beforeBlockId '${pl.beforeBlockId}' not found.`);
+        newParentId = ref.get("sys:parent") as string;
+        const children = ensureChildrenArray(findBlockById(blocks, newParentId)!);
+        insertIdx = indexOfChild(children, pl.beforeBlockId);
+      } else if (pl.parentId) {
+        newParentId = pl.parentId;
+        if (!findBlockById(blocks, newParentId)) throw new Error(`placement.parentId '${newParentId}' not found.`);
+        const children = ensureChildrenArray(findBlockById(blocks, newParentId)!);
+        insertIdx = pl.index !== undefined ? Math.min(pl.index, children.length) : children.length;
+      } else {
+        throw new Error("placement must specify afterBlockId, beforeBlockId, or parentId.");
+      }
+
+      // Insert into new parent
+      const prevSV = Y.encodeStateVector(doc);
+      const newParent = findBlockById(blocks, newParentId)!;
+      ensureChildrenArray(newParent).insert(insertIdx, [parsed.blockId]);
+      block.set("sys:parent", newParentId);
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+      await touchDocMeta(socket, workspaceId, parsed.docId);
+
+      return text({ moved: true, blockId: parsed.blockId, newParentId, insertIdx });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const moveBlockMeta = {
+    title: "Move Block",
+    description: "Move/reorder a block within a document. Specify new position via placement (afterBlockId, beforeBlockId, or parentId + optional index).",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("ID of the block to move"),
+      placement: z.object({
+        parentId: z.string().optional().describe("Target parent block ID"),
+        afterBlockId: z.string().optional().describe("Insert after this block"),
+        beforeBlockId: z.string().optional().describe("Insert before this block"),
+        index: z.number().optional().describe("Index within parent (used with parentId)"),
+      }).describe("New position for the block"),
+    },
+  };
+  server.registerTool("move_block", moveBlockMeta, moveBlockHandler as any);
+  server.registerTool("affine_move_block", moveBlockMeta, moveBlockHandler as any);
+
+  // ── update_doc_title ──────────────────────────────────────────────────
+  const updateDocTitleHandler = async (parsed: {
+    workspaceId?: string; docId: string; title: string;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+
+      // Update prop:title on the page block
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      if (!pageId) throw new Error("Document has no page block.");
+      const pageBlock = blocks.get(pageId) as Y.Map<any>;
+
+      const prevSV = Y.encodeStateVector(doc);
+      const titleYText = pageBlock.get("prop:title");
+      if (titleYText instanceof Y.Text) {
+        titleYText.delete(0, titleYText.length);
+        titleYText.insert(0, parsed.title);
+      } else {
+        const yt = new Y.Text();
+        yt.insert(0, parsed.title);
+        pageBlock.set("prop:title", yt);
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+
+      // Update workspace meta pages entry
+      const wsDoc = new Y.Doc();
+      const wsSnap = await loadDoc(socket, workspaceId, workspaceId);
+      if (wsSnap.missing) Y.applyUpdate(wsDoc, Buffer.from(wsSnap.missing, "base64"));
+      const wsPrevSV = Y.encodeStateVector(wsDoc);
+      const wsMeta = wsDoc.getMap("meta");
+      const pages = wsMeta.get("pages") as Y.Array<Y.Map<any>> | undefined;
+      if (pages) {
+        pages.forEach((entry: any) => {
+          if (entry?.get && entry.get("id") === parsed.docId) {
+            entry.set("title", parsed.title);
+            entry.set("updatedDate", Date.now());
+          }
+        });
+      }
+      const wsDelta = Y.encodeStateAsUpdate(wsDoc, wsPrevSV);
+      if (wsDelta.byteLength > 0) {
+        await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString("base64"));
+      }
+
+      return text({ updated: true, docId: parsed.docId, title: parsed.title });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const updateDocTitleMeta = {
+    title: "Update Document Title",
+    description: "Rename a document. Updates the page block's prop:title and the workspace meta entry.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      title: z.string().min(1).describe("New document title"),
+    },
+  };
+  server.registerTool("update_doc_title", updateDocTitleMeta, updateDocTitleHandler as any);
+  server.registerTool("affine_update_doc_title", updateDocTitleMeta, updateDocTitleHandler as any);
+
   const updateDocMarkdownHandler = async (parsed: {
     workspaceId?: string; docId: string;
     old_markdown: string; new_markdown: string; dryRun?: boolean;
@@ -2389,34 +2562,30 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       if (currentMd.indexOf(parsed.old_markdown, idx + 1) !== -1)
         throw new Error("old_markdown matches multiple locations in the document. Include more surrounding text to make it unique.");
 
-      const newMd = currentMd.slice(0, idx) + parsed.new_markdown + currentMd.slice(idx + parsed.old_markdown.length);
+      if (parsed.dryRun) {
+        const newMd = currentMd.slice(0, idx) + parsed.new_markdown + currentMd.slice(idx + parsed.old_markdown.length);
+        return text({ dryRun: true, currentMarkdown: currentMd, patchedMarkdown: newMd });
+      }
 
-      if (parsed.dryRun) return text({ dryRun: true, currentMarkdown: currentMd, patchedMarkdown: newMd });
-
-      // 4. Find which top-level blocks are affected by the change
+      // 4. Convert line ranges to char offsets
       const mdLines = currentMd.split("\n");
-      // Convert char offset to line number
-      let charCount = 0;
-      let changeStartLine = 0;
+      const lineToCharOffset: number[] = [0];
       for (let i = 0; i < mdLines.length; i++) {
-        if (charCount + mdLines[i].length >= idx) { changeStartLine = i; break; }
-        charCount += mdLines[i].length + 1; // +1 for \n
-      }
-      const changeEndOffset = idx + parsed.old_markdown.length;
-      charCount = 0;
-      let changeEndLine = mdLines.length;
-      for (let i = 0; i < mdLines.length; i++) {
-        charCount += mdLines[i].length + 1;
-        if (charCount >= changeEndOffset) { changeEndLine = i + 1; break; }
+        lineToCharOffset.push(lineToCharOffset[i] + mdLines[i].length + 1); // +1 for \n
       }
 
-      // Find affected top-level block IDs (those whose line ranges overlap the change)
+      // Find affected blocks (those whose char ranges overlap the change)
+      const changeStart = idx;
+      const changeEnd = idx + parsed.old_markdown.length;
       const affectedBlockIds: string[] = [];
       let firstAffectedIdx = -1;
       let lastAffectedIdx = -1;
+
       for (let i = 0; i < blockLineRanges.length; i++) {
         const r = blockLineRanges[i];
-        if (r.endLine > changeStartLine && r.startLine < changeEndLine) {
+        const blockStart = lineToCharOffset[r.startLine];
+        const blockEnd = lineToCharOffset[r.endLine];
+        if (blockEnd > changeStart && blockStart < changeEnd) {
           affectedBlockIds.push(r.blockId);
           if (firstAffectedIdx === -1) firstAffectedIdx = i;
           lastAffectedIdx = i;
@@ -2424,26 +2593,18 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       }
 
       if (affectedBlockIds.length === 0) {
-        // Edge case: change is in title or whitespace only — fall back to full rewrite
-        firstAffectedIdx = 0;
-        lastAffectedIdx = blockLineRanges.length - 1;
-        for (const r of blockLineRanges) affectedBlockIds.push(r.blockId);
+        throw new Error("Change is in title or whitespace only. Use write_doc_from_markdown for title changes.");
       }
 
       // 5. Extract the new markdown for just the affected region
-      // Before affected = lines before first affected block
-      // After affected = lines after last affected block
-      const beforeLines = firstAffectedIdx > 0 ? blockLineRanges[firstAffectedIdx].startLine : (title ? 2 : 0);
-      const afterStartLine = lastAffectedIdx < blockLineRanges.length - 1
-        ? blockLineRanges[lastAffectedIdx].endLine
-        : mdLines.length;
-
-      const newMdLines = newMd.split("\n");
-      // The lines before the affected region are the same count
-      // The lines after the affected region start at (newMdLines.length - (mdLines.length - afterStartLine))
-      const afterLinesCount = mdLines.length - afterStartLine;
-      const newRegionEnd = newMdLines.length - afterLinesCount;
-      const newRegionMd = newMdLines.slice(beforeLines, newRegionEnd).join("\n");
+      const regionStart = lineToCharOffset[blockLineRanges[firstAffectedIdx].startLine];
+      const regionEnd = lineToCharOffset[blockLineRanges[lastAffectedIdx].endLine];
+      
+      // Compute new region directly without allocating full newMd
+      const newRegionMd = 
+        currentMd.slice(regionStart, idx) + 
+        parsed.new_markdown + 
+        currentMd.slice(idx + parsed.old_markdown.length, regionEnd);
 
       // 6. Surgical update: remove affected blocks, parse new region, insert at position
       const prevSV = Y.encodeStateVector(doc);
@@ -2452,7 +2613,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       // Find insertion index in noteChildren
       let insertIdx = 0;
       if (firstAffectedIdx > 0) {
-        // Insert after the block before the first affected
         const prevBlockId = blockLineRanges[firstAffectedIdx - 1].blockId;
         const prevIdx = indexOfChild(noteChildren, prevBlockId);
         insertIdx = prevIdx >= 0 ? prevIdx + 1 : 0;
@@ -2465,38 +2625,20 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         removeBlockTree(blocks, bid);
       }
 
-      // Parse the new region markdown and insert blocks at the right position
-      // Strip title if it appears at the start of the region
-      let regionMd = newRegionMd;
-      if (title) {
-        const titlePattern = new RegExp(`^#\\s+${title.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
-        regionMd = regionMd.replace(titlePattern, "");
-      }
-
-      // Create a temporary note to collect new blocks, then splice them into the real note
+      // Parse new region and collect new block IDs
       const tempNoteId = generateId();
-      const tempNote = new Y.Map<any>();
-      setSysFields(tempNote, tempNoteId, "affine:note");
       const tempChildren = new Y.Array<string>();
-      tempNote.set("sys:children", tempChildren);
-      blocks.set(tempNoteId, tempNote);
-
-      const mdTokens = mdParser.parse(regionMd, {});
+      const mdTokens = mdParser.parse(newRegionMd, {});
       markdownToBlocks(mdTokens, tempNoteId, blocks, tempChildren);
 
-      // Move new blocks from temp note to real note at insertIdx
+      // Insert new blocks into real note at insertIdx
       const newBlockIds: string[] = childIdsFrom(tempChildren);
       for (let i = 0; i < newBlockIds.length; i++) {
         const bid = newBlockIds[i];
-        // Update parent reference
         const block = blocks.get(bid);
         if (block instanceof Y.Map) block.set("sys:parent", noteId);
         noteChildren.insert(insertIdx + i, [bid]);
       }
-
-      // Clean up temp note
-      tempChildren.delete(0, tempChildren.length);
-      blocks.delete(tempNoteId);
 
       // 7. Push single CRDT delta
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
