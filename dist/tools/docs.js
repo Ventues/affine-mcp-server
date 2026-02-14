@@ -694,27 +694,25 @@ export function registerDocTools(server, gql, defaults) {
                 setSysFields(block, blockId, "affine:table");
                 block.set("sys:parent", parentId);
                 block.set("sys:children", new Y.Array());
-                const rowsMap = new Y.Map();
-                const columnsMap = new Y.Map();
-                const cellsMap = new Y.Map();
+                const rowIdsList = [];
+                const colIdsList = [];
                 for (let i = 0; i < normalized.rows; i++) {
                     const rowId = generateId();
-                    rowsMap.set(rowId, { rowId, order: `r${String(i).padStart(4, "0")}` });
+                    rowIdsList.push(rowId);
+                    block.set(`prop:rows.${rowId}.rowId`, rowId);
+                    block.set(`prop:rows.${rowId}.order`, `a${String(i).padStart(2, "0")}`);
                 }
                 for (let i = 0; i < normalized.columns; i++) {
                     const columnId = generateId();
-                    columnsMap.set(columnId, { columnId, order: `c${String(i).padStart(4, "0")}` });
+                    colIdsList.push(columnId);
+                    block.set(`prop:columns.${columnId}.columnId`, columnId);
+                    block.set(`prop:columns.${columnId}.order`, `a${String(i).padStart(2, "0")}`);
                 }
-                for (const rowId of Array.from(rowsMap.keys())) {
-                    for (const columnId of Array.from(columnsMap.keys())) {
-                        const cellMap = new Y.Map();
-                        cellMap.set("text", makeText(""));
-                        cellsMap.set(`${rowId}:${columnId}`, cellMap);
+                for (const rowId of rowIdsList) {
+                    for (const columnId of colIdsList) {
+                        block.set(`prop:cells.${rowId}:${columnId}.text`, makeText(""));
                     }
                 }
-                block.set("prop:rows", rowsMap);
-                block.set("prop:columns", columnsMap);
-                block.set("prop:cells", cellsMap);
                 block.set("prop:comments", undefined);
                 block.set("prop:textAlign", undefined);
                 return { blockId, block, flavour: "affine:table" };
@@ -1750,32 +1748,29 @@ export function registerDocTools(server, gql, defaults) {
                 i++; // table_close
                 const nRows = tableRows.length;
                 const nCols = nRows > 0 ? Math.max(...tableRows.map(r => r.length)) : 1;
-                // Build AFFiNE table block with Y.Map instances for CRDT persistence
+                // Build AFFiNE table block using flat dot-notation keys (native format)
                 const rowIds = [];
                 const colIds = [];
-                const rowsMap = new Y.Map();
-                const columnsMap = new Y.Map();
-                const cellsMap = new Y.Map();
+                const flatProps = {};
                 for (let r = 0; r < nRows; r++) {
                     const rid = generateId();
                     rowIds.push(rid);
-                    rowsMap.set(rid, { rowId: rid, order: `r${String(r).padStart(4, "0")}` });
+                    flatProps[`prop:rows.${rid}.rowId`] = rid;
+                    flatProps[`prop:rows.${rid}.order`] = `a${String(r).padStart(2, "0")}`;
                 }
                 for (let c = 0; c < nCols; c++) {
                     const cid = generateId();
                     colIds.push(cid);
-                    columnsMap.set(cid, { columnId: cid, order: `c${String(c).padStart(4, "0")}` });
+                    flatProps[`prop:columns.${cid}.columnId`] = cid;
+                    flatProps[`prop:columns.${cid}.order`] = `a${String(c).padStart(2, "0")}`;
                 }
                 for (let r = 0; r < nRows; r++) {
                     for (let c = 0; c < nCols; c++) {
-                        const cellChildren = tableRows[r]?.[c] || [];
-                        const cellMap = new Y.Map();
-                        cellMap.set("text", makeRichText(cellChildren));
-                        cellsMap.set(`${rowIds[r]}:${colIds[c]}`, cellMap);
+                        flatProps[`prop:cells.${rowIds[r]}:${colIds[c]}.text`] = makeRichText(tableRows[r]?.[c] || []);
                     }
                 }
                 addBlock(noteId, noteChildren, "affine:table", {
-                    "prop:rows": rowsMap, "prop:columns": columnsMap, "prop:cells": cellsMap,
+                    ...flatProps,
                     "prop:comments": undefined, "prop:textAlign": undefined,
                 });
                 continue;
@@ -1928,17 +1923,62 @@ export function registerDocTools(server, gql, defaults) {
                     break;
                 }
                 case "affine:table": {
+                    // Support both nested Y.Map format and flat dot-notation format (native AFFiNE)
                     const rowsRaw = raw.get("prop:rows");
                     const colsRaw = raw.get("prop:columns");
                     const cellsRaw = raw.get("prop:cells");
-                    const toObj = (v) => v instanceof Y.Map ? v.toJSON() : (typeof v === "object" && v ? v : {});
-                    const rowsObj = rowsRaw ? toObj(rowsRaw) : {};
-                    const colsObj = colsRaw ? toObj(colsRaw) : {};
+                    // Collect row/col/cell data from flat dot-notation keys if nested keys are absent
+                    const rowsObj = {};
+                    const colsObj = {};
+                    const flatCells = {};
+                    if (rowsRaw instanceof Y.Map) {
+                        const j = rowsRaw.toJSON();
+                        for (const [k, v] of Object.entries(j))
+                            rowsObj[k] = v;
+                    }
+                    else if (rowsRaw && typeof rowsRaw === "object") {
+                        for (const [k, v] of Object.entries(rowsRaw))
+                            rowsObj[k] = v;
+                    }
+                    if (colsRaw instanceof Y.Map) {
+                        const j = colsRaw.toJSON();
+                        for (const [k, v] of Object.entries(j))
+                            colsObj[k] = v;
+                    }
+                    else if (colsRaw && typeof colsRaw === "object") {
+                        for (const [k, v] of Object.entries(colsRaw))
+                            colsObj[k] = v;
+                    }
+                    // Scan for flat dot-notation keys: prop:rows.<id>.rowId, prop:columns.<id>.columnId, prop:cells.<key>.text
+                    raw.forEach((_v, k) => {
+                        const rowMatch = k.match(/^prop:rows\.([^.]+)\.order$/);
+                        if (rowMatch) {
+                            const rid = rowMatch[1];
+                            if (!rowsObj[rid])
+                                rowsObj[rid] = {};
+                            rowsObj[rid].order = _v;
+                        }
+                        const colMatch = k.match(/^prop:columns\.([^.]+)\.order$/);
+                        if (colMatch) {
+                            const cid = colMatch[1];
+                            if (!colsObj[cid])
+                                colsObj[cid] = {};
+                            colsObj[cid].order = _v;
+                        }
+                        const cellMatch = k.match(/^prop:cells\.(.+)\.text$/);
+                        if (cellMatch) {
+                            flatCells[cellMatch[1]] = _v;
+                        }
+                    });
                     const sortedRowIds = Object.keys(rowsObj).sort((a, b) => (rowsObj[a]?.order ?? "").localeCompare(rowsObj[b]?.order ?? ""));
                     const sortedColIds = Object.keys(colsObj).sort((a, b) => (colsObj[a]?.order ?? "").localeCompare(colsObj[b]?.order ?? ""));
-                    if (sortedRowIds.length > 0 && sortedColIds.length > 0 && cellsRaw) {
+                    if (sortedRowIds.length > 0 && sortedColIds.length > 0) {
                         const readCell = (rowId, colId) => {
                             const key = `${rowId}:${colId}`;
+                            // Check flat cells first
+                            if (key in flatCells)
+                                return richTextToMarkdown(flatCells[key]);
+                            // Then nested Y.Map format
                             if (cellsRaw instanceof Y.Map) {
                                 const cell = cellsRaw.get(key);
                                 if (cell instanceof Y.Map)
@@ -1946,10 +1986,11 @@ export function registerDocTools(server, gql, defaults) {
                                 if (cell instanceof Y.Text)
                                     return richTextToMarkdown(cell);
                             }
-                            const obj = toObj(cellsRaw);
-                            const c = obj[key];
-                            if (c && typeof c === "object" && "text" in c)
-                                return richTextToMarkdown(c.text);
+                            if (cellsRaw && typeof cellsRaw === "object" && !(cellsRaw instanceof Y.Map)) {
+                                const c = cellsRaw[key];
+                                if (c && typeof c === "object" && "text" in c)
+                                    return richTextToMarkdown(c.text);
+                            }
                             return "";
                         };
                         for (let r = 0; r < sortedRowIds.length; r++) {
@@ -1961,14 +2002,7 @@ export function registerDocTools(server, gql, defaults) {
                         lines.push("");
                     }
                     else {
-                        const nRows = Math.max(sortedRowIds.length, 1);
-                        const nCols = Math.max(sortedColIds.length, 1);
-                        const emptyRow = `|${" |".repeat(nCols)}`;
-                        lines.push(emptyRow);
-                        lines.push(`|${" --- |".repeat(nCols)}`);
-                        for (let r = 1; r < nRows; r++)
-                            lines.push(emptyRow);
-                        lines.push("");
+                        lines.push("| |", "| --- |", "");
                     }
                     break;
                 }
