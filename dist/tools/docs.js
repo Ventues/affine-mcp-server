@@ -2011,6 +2011,37 @@ export function registerDocTools(server, gql, defaults) {
             dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
         },
     }, writeDocFromMarkdownHandler);
+    // ── update_doc_markdown (str_replace style partial update) ────────────
+    const updateDocMarkdownHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId)
+            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+        const readResult = await readDocAsMarkdownHandler({ workspaceId, docId: parsed.docId });
+        const currentMd = JSON.parse(readResult.content[0].text).markdown || "";
+        const idx = currentMd.indexOf(parsed.old_markdown);
+        if (idx === -1)
+            throw new Error("old_markdown not found in document. Make sure it matches the exact text from read_doc_as_markdown.");
+        if (currentMd.indexOf(parsed.old_markdown, idx + 1) !== -1)
+            throw new Error("old_markdown matches multiple locations in the document. Include more surrounding text to make it unique.");
+        const newMd = currentMd.slice(0, idx) + parsed.new_markdown + currentMd.slice(idx + parsed.old_markdown.length);
+        if (parsed.dryRun)
+            return text({ dryRun: true, currentMarkdown: currentMd, patchedMarkdown: newMd });
+        await writeDocFromMarkdownHandler({ workspaceId, docId: parsed.docId, markdown: newMd });
+        return text({ patched: true, docId: parsed.docId });
+    };
+    const updateDocMarkdownMeta = {
+        title: "Update Document Markdown",
+        description: "Partial doc update using str_replace style. Reads the doc as markdown, finds the old_markdown substring (must match exactly once), replaces it with new_markdown, and writes back. Use dryRun=true to preview changes. Only send the changed section — avoids rewriting the entire doc.",
+        inputSchema: {
+            workspaceId: WorkspaceId.optional(),
+            docId: DocId,
+            old_markdown: z.string().describe("Exact markdown substring to find and replace. Must match exactly once in the document."),
+            new_markdown: z.string().describe("Replacement markdown string."),
+            dryRun: z.boolean().optional().describe("If true, returns current and patched markdown without writing."),
+        },
+    };
+    server.registerTool("update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler);
+    server.registerTool("affine_update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler);
     const publishDocHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId) {

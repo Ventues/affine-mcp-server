@@ -14,9 +14,12 @@ import { registerBlobTools } from "./tools/blobStorage.js";
 import { registerNotificationTools } from "./tools/notifications.js";
 import { loginWithPassword } from "./auth.js";
 import { registerAuthTools } from "./tools/auth.js";
+import { createRequire } from "node:module";
+const require = createRequire(import.meta.url);
+const pkg = require("../package.json");
 const config = loadConfig();
 async function buildServer() {
-    const server = new McpServer({ name: "affine-mcp", version: "1.5.0-fork.1" });
+    const server = new McpServer({ name: "affine-mcp", version: `${pkg.version}-fork.${pkg.forkVersion}` });
     // Initialize GraphQL client with authentication
     const gql = new GraphQLClient({
         endpoint: `${config.baseUrl}${config.graphqlPath}`,

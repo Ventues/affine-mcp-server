@@ -1,13 +1,16 @@
 /**
  * Integration tests for affine-mcp-server.
  *
- * Requires env vars:
+ * Env vars loaded from .env.test (or set manually):
  *   AFFINE_BASE_URL   — e.g. https://affine.workisboring.com
  *   AFFINE_API_TOKEN  — personal access token
  *   AFFINE_WORKSPACE_ID — workspace to test in
  *
  * Run:  npm test
  */
+import { readFileSync } from "node:fs";
+import { resolve, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
@@ -20,6 +23,16 @@ import {
   pushDocUpdate,
   deleteDoc as wsDeleteDoc,
 } from "../src/ws.js";
+
+// ── Load .env.test ──────────────────────────────────────────────────────
+const __dirname = dirname(fileURLToPath(import.meta.url));
+try {
+  const envFile = readFileSync(resolve(__dirname, "../.env.test"), "utf-8");
+  for (const line of envFile.split("\n")) {
+    const m = line.match(/^\s*([^#=]+?)\s*=\s*(.*?)\s*$/);
+    if (m && !process.env[m[1]]) process.env[m[1]] = m[2];
+  }
+} catch {}
 
 // ── Config ──────────────────────────────────────────────────────────────
 const BASE_URL = process.env.AFFINE_BASE_URL;
@@ -340,6 +353,108 @@ describe("integration", () => {
     assert.equal(goodDelta.length, 2, "with null, Y.js keeps separate segments");
     assert.equal(goodDelta[0].attributes?.bold, true);
     assert.equal(goodDelta[1].attributes, undefined);
+  });
+
+  it("update_doc_markdown str_replace logic", () => {
+    const currentMd = "# Title\n\nFirst paragraph.\n\nSecond paragraph.\n\n## Section A\n\nContent A.\n";
+
+    // Successful single match
+    const old1 = "Second paragraph.";
+    const new1 = "Replaced paragraph.";
+    const idx1 = currentMd.indexOf(old1);
+    assert.ok(idx1 !== -1, "should find old_markdown");
+    assert.equal(currentMd.indexOf(old1, idx1 + 1), -1, "should match only once");
+    const patched1 = currentMd.slice(0, idx1) + new1 + currentMd.slice(idx1 + old1.length);
+    assert.ok(patched1.includes("Replaced paragraph."));
+    assert.ok(!patched1.includes("Second paragraph."));
+    assert.ok(patched1.includes("First paragraph."), "untouched content preserved");
+
+    // Not found
+    assert.equal(currentMd.indexOf("nonexistent text"), -1, "should not find missing text");
+
+    // Multiple matches should be rejected
+    const duped = "aaa\nbbb\naaa\n";
+    const dupIdx = duped.indexOf("aaa");
+    assert.ok(duped.indexOf("aaa", dupIdx + 1) !== -1, "should detect multiple matches");
+  });
+
+  it("update_doc_markdown round-trip via WS", async () => {
+    // 1. Create doc with content
+    const { ydoc, docId, noteId } = createEmptyDoc("Patch Test");
+    docsToCleanup.push(docId);
+
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    // Add two paragraphs
+    function addPara(text: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, "affine:paragraph");
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      b.set("prop:type", "text");
+      const yt = new Y.Text();
+      yt.insert(0, text);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+    }
+    addPara("Hello world");
+    addPara("Goodbye world");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // 2. Read back and verify both paragraphs exist
+    const blocks2 = await readBlocks(socket, docId);
+    const flavours = noteChildFlavours(blocks2);
+    assert.equal(flavours.length, 2);
+
+    // 3. Simulate update_doc_markdown: read text, str_replace, write back
+    // Read all paragraph texts
+    const noteBlock = findByFlavour(blocks2, "affine:note")!;
+    const childIds: string[] = [];
+    (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+    const texts = childIds.map((id) => {
+      const b = blocks2.get(id) as Y.Map<any>;
+      return b.get("prop:text")?.toString() || "";
+    });
+    assert.ok(texts.includes("Hello world"));
+    assert.ok(texts.includes("Goodbye world"));
+
+    // 4. Patch: replace "Goodbye world" with "Updated world" at Y.Doc level
+    const doc3 = new Y.Doc();
+    const snap3 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc3, Buffer.from(snap3.missing!, "base64"));
+    const prevSV = Y.encodeStateVector(doc3);
+    const blocks3 = doc3.getMap("blocks") as Y.Map<any>;
+    const note3 = findByFlavour(blocks3, "affine:note")!;
+    const kids3: string[] = [];
+    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => kids3.push(id));
+    for (const kid of kids3) {
+      const b = blocks3.get(kid) as Y.Map<any>;
+      const yt = b.get("prop:text") as Y.Text | undefined;
+      if (yt && yt.toString() === "Goodbye world") {
+        yt.delete(0, yt.length);
+        yt.insert(0, "Updated world");
+      }
+    }
+    const delta = Y.encodeStateAsUpdate(doc3, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // 5. Read back and verify patch applied
+    const blocks4 = await readBlocks(socket, docId);
+    const note4 = findByFlavour(blocks4, "affine:note")!;
+    const kids4: string[] = [];
+    (note4.get("sys:children") as Y.Array<any>).forEach((id: string) => kids4.push(id));
+    const texts4 = kids4.map((id) => {
+      const b = blocks4.get(id) as Y.Map<any>;
+      return b.get("prop:text")?.toString() || "";
+    });
+    assert.ok(texts4.includes("Hello world"), "untouched paragraph preserved");
+    assert.ok(texts4.includes("Updated world"), "patched paragraph updated");
+    assert.ok(!texts4.includes("Goodbye world"), "old text removed");
   });
 
   it("special AFFiNE patterns detected in markdown", () => {
