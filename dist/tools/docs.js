@@ -1877,11 +1877,14 @@ export function registerDocTools(server, gql, defaults) {
                     }
                 }
             }
+            const tempKey = `__temp_${Date.now()}`;
             const tempChildren = new Y.Array();
+            doc.getMap("__temp").set(tempKey, tempChildren);
             const mdTokens = mdParser.parse(md, {});
             markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
             // Insert new blocks at the replace position
             const newIds = tempChildren.toArray();
+            doc.getMap("__temp").delete(tempKey);
             if (newIds.length > 0)
                 noteChildren.insert(replaceStart, newIds);
             const delta = Y.encodeStateAsUpdate(doc, prevSV);
