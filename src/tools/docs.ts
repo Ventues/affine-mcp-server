@@ -2387,6 +2387,78 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     }
   }
 
+  // ── update_block (edit block text/properties in-place) ────────────────
+  const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+
+  const updateBlockHandler = async (parsed: {
+    workspaceId?: string; docId: string; blockId: string;
+    text?: string; properties?: Record<string, any>;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+      const block = findBlockById(blocks, parsed.blockId);
+      if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
+
+      const flavour = block.get("sys:flavour") as string;
+      if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot update structural block (${flavour}).`);
+
+      const prevSV = Y.encodeStateVector(doc);
+
+      // Update text in-place (preserves Y.Text identity for CRDT correctness)
+      if (parsed.text !== undefined) {
+        const yText = block.get("prop:text");
+        if (yText instanceof Y.Text) {
+          yText.delete(0, yText.length);
+          yText.insert(0, parsed.text);
+        } else {
+          block.set("prop:text", makeText(parsed.text));
+        }
+      }
+
+      // Update properties
+      if (parsed.properties) {
+        for (const [key, value] of Object.entries(parsed.properties)) {
+          const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
+          block.set(propKey, value);
+        }
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"));
+      await touchDocMetaOnSocket(socket, workspaceId, parsed.docId);
+
+      return text({ updated: true, blockId: parsed.blockId, flavour });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const updateBlockMeta = {
+    title: "Update Block",
+    description: "Edit an existing block's text or properties in-place. Cannot update structural blocks (page, surface, note). For text updates, the Y.Text is modified in-place preserving CRDT identity.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      blockId: z.string().min(1).describe("ID of the block to update"),
+      text: z.string().optional().describe("New plain text content for the block"),
+      properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
+    },
+  };
+  server.registerTool("update_block", updateBlockMeta, updateBlockHandler as any);
+  server.registerTool("affine_update_block", updateBlockMeta, updateBlockHandler as any);
+
   const updateDocMarkdownHandler = async (parsed: {
     workspaceId?: string; docId: string;
     old_markdown: string; new_markdown: string; dryRun?: boolean;
