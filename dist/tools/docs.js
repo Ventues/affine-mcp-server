@@ -2180,6 +2180,66 @@ export function registerDocTools(server, gql, defaults) {
     };
     server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler);
     server.registerTool("affine_delete_block", deleteBlockMeta, deleteBlockHandler);
+    // ── delete_blocks (bulk delete) ───────────────────────────────────────
+    const deleteBlocksHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId)
+            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+        try {
+            await joinWorkspace(socket, workspaceId);
+            const doc = new Y.Doc();
+            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+            if (!snapshot.missing)
+                throw new Error(`Document '${parsed.docId}' not found.`);
+            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+            const blocks = doc.getMap("blocks");
+            const deleted = [];
+            const prevSV = Y.encodeStateVector(doc);
+            for (const blockId of parsed.blockIds) {
+                const block = findBlockById(blocks, blockId);
+                if (!block)
+                    continue; // skip missing blocks
+                const flavour = block.get("sys:flavour");
+                if (STRUCTURAL_FLAVOURS.has(flavour))
+                    continue; // skip structural blocks
+                // Remove from parent's sys:children
+                const parentId = block.get("sys:parent");
+                if (parentId) {
+                    const parent = findBlockById(blocks, parentId);
+                    if (parent) {
+                        const children = ensureChildrenArray(parent);
+                        const idx = indexOfChild(children, blockId);
+                        if (idx >= 0)
+                            children.delete(idx, 1);
+                    }
+                }
+                removeBlockTree(blocks, blockId);
+                deleted.push(blockId);
+            }
+            const delta = Y.encodeStateAsUpdate(doc, prevSV);
+            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+                .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+            await touchDocMeta(socket, workspaceId, parsed.docId);
+            return text({ deleted: deleted.length, blockIds: deleted });
+        }
+        finally {
+            socket.disconnect();
+        }
+    };
+    const deleteBlocksMeta = {
+        title: "Delete Multiple Blocks",
+        description: "Delete multiple blocks in a single transaction. Skips structural blocks (page, surface, note) and missing blocks.",
+        inputSchema: {
+            workspaceId: WorkspaceId.optional(),
+            docId: DocId,
+            blockIds: z.array(z.string().min(1)).describe("Array of block IDs to delete"),
+        },
+    };
+    server.registerTool("delete_blocks", deleteBlocksMeta, deleteBlocksHandler);
+    server.registerTool("affine_delete_blocks", deleteBlocksMeta, deleteBlocksHandler);
     // ── move_block (reorder / reparent a block) ───────────────────────────
     const moveBlockHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;

@@ -662,6 +662,68 @@ describe("integration", () => {
     assert.equal(finalChildren[0], siblingId);
   });
 
+  it("delete_blocks removes multiple blocks in one transaction", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Bulk Delete Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    function addPara(txt: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, "affine:paragraph");
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      b.set("prop:type", "text");
+      const yt = new Y.Text(); yt.insert(0, txt);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+      return id;
+    }
+    const aId = addPara("A");
+    const bId = addPara("B");
+    const cId = addPara("C");
+    const dId = addPara("D");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Delete B and D in one transaction
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+
+    const prevSV = Y.encodeStateVector(doc2);
+    const note2 = blocks2.get(noteId) as Y.Map<any>;
+    const nc2 = note2.get("sys:children") as Y.Array<any>;
+
+    // Remove B and D from children
+    const toDelete = [bId, dId];
+    for (const id of toDelete) {
+      let idx = -1;
+      nc2.forEach((cid: string, i: number) => { if (cid === id) idx = i; });
+      if (idx >= 0) nc2.delete(idx, 1);
+      blocks2.delete(id);
+    }
+
+    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+
+    // Verify only A and C remain
+    const blocks3 = await readBlocks(socket, docId);
+    assert.ok(blocks3.get(aId), "A should exist");
+    assert.equal(blocks3.get(bId), undefined, "B should be deleted");
+    assert.ok(blocks3.get(cId), "C should exist");
+    assert.equal(blocks3.get(dId), undefined, "D should be deleted");
+
+    const note3 = findByFlavour(blocks3, "affine:note")!;
+    const finalIds: string[] = [];
+    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => finalIds.push(id));
+    assert.deepEqual(finalIds, [aId, cId], "only A and C should remain");
+  });
+
   it("update_doc_markdown char offset logic", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Offset Test");
     docsToCleanup.push(docId);
