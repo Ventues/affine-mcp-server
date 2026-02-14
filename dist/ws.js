@@ -10,12 +10,20 @@ export function wsUrlFromGraphQLEndpoint(endpoint) {
 }
 export async function connectWorkspaceSocket(wsUrl, extraHeaders) {
     return new Promise((resolve, reject) => {
-        const socket = io(wsUrl, {
+        const socketOptions = {
             transports: ['websocket'],
             path: '/socket.io/',
-            extraHeaders: extraHeaders && Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
             autoConnect: true
-        });
+        };
+        // Add auth token if present in headers
+        if (extraHeaders?.Authorization) {
+            socketOptions.auth = { token: extraHeaders.Authorization.replace('Bearer ', '') };
+        }
+        // Add extra headers if present
+        if (extraHeaders && Object.keys(extraHeaders).length > 0) {
+            socketOptions.extraHeaders = extraHeaders;
+        }
+        const socket = io(wsUrl, socketOptions);
         const timeout = setTimeout(() => {
             cleanup();
             socket.disconnect();

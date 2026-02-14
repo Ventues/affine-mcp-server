@@ -1244,3 +1244,196 @@ describe("integration", () => {
     }
   });
 });
+
+
+// ── Comment Tests ───────────────────────────────────────────────────────
+describe("Comment operations", () => {
+  let testDocId: string;
+  let testBlockId: string;
+
+  before(async () => {
+    requireEnv();
+    // Create a test document with a simple text block
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+
+    const { ydoc, docId, noteId } = createEmptyDoc("Comment Test Doc");
+    testDocId = docId;
+
+    const blocks = ydoc.getMap("blocks") as Y.Map<any>;
+    const noteBlock = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = noteBlock.get("sys:children") as Y.Array<any>;
+
+    // Add a paragraph with text
+    const paraId = genId();
+    testBlockId = paraId;
+    const para = new Y.Map();
+    setSys(para, paraId, "affine:paragraph");
+    para.set("sys:parent", noteId);
+    para.set("sys:children", new Y.Array());
+    para.set("prop:type", "text");
+    const text = new Y.Text();
+    text.insert(0, "Click anywhere to start typing");
+    para.set("prop:text", text);
+    blocks.set(paraId, para);
+    noteChildren.push([paraId]);
+
+    const update = Y.encodeStateAsUpdate(ydoc);
+    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
+    socket.disconnect();
+  });
+
+  after(async () => {
+    // Clean up test document
+    if (testDocId) {
+      const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+        Authorization: `Bearer ${TOKEN}`,
+      });
+      await joinWorkspace(socket, WORKSPACE_ID!);
+      await wsDeleteDoc(socket, WORKSPACE_ID!, testDocId);
+      socket.disconnect();
+    }
+  });
+
+  it("should create comment with text highlighting", async () => {
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+
+    // Load document
+    const docData = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc = new Y.Doc();
+    if (docData.missing) {
+      Y.applyUpdate(ydoc, Buffer.from(docData.missing, "base64"));
+    }
+
+    const blocks = ydoc.getMap("blocks");
+    const block = blocks.get(testBlockId) as Y.Map<any>;
+    assert.ok(block, "Test block should exist");
+
+    const text = block.get("prop:text") as Y.Text;
+    const textContent = text.toString();
+    assert.equal(textContent, "Click anywhere to start typing");
+
+    // Apply comment formatting
+    const commentId = "test-comment-" + Date.now();
+    const selectedText = "anywhere";
+    const startIndex = textContent.indexOf(selectedText);
+    assert.notEqual(startIndex, -1, "Selected text should be found");
+
+    text.format(startIndex, selectedText.length, { [`comment-${commentId}`]: true });
+
+    // Push update
+    const update = Y.encodeStateAsUpdate(ydoc);
+    await pushDocUpdate(socket, WORKSPACE_ID!, testDocId, Buffer.from(update).toString("base64"));
+
+    // Verify formatting was applied
+    const docData2 = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc2 = new Y.Doc();
+    if (docData2.missing) {
+      Y.applyUpdate(ydoc2, Buffer.from(docData2.missing, "base64"));
+    }
+
+    const blocks2 = ydoc2.getMap("blocks");
+    const block2 = blocks2.get(testBlockId) as Y.Map<any>;
+    const text2 = block2.get("prop:text") as Y.Text;
+    const delta = text2.toDelta();
+
+    let foundFormatting = false;
+    for (const op of delta) {
+      if (op.attributes && op.attributes[`comment-${commentId}`]) {
+        foundFormatting = true;
+        assert.equal(op.insert, selectedText, "Formatted text should match selected text");
+      }
+    }
+    assert.ok(foundFormatting, "Comment formatting should be present");
+
+    socket.disconnect();
+  });
+
+  it("should remove comment formatting on delete", async () => {
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+
+    // Load document
+    const docData = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc = new Y.Doc();
+    if (docData.missing) {
+      Y.applyUpdate(ydoc, Buffer.from(docData.missing, "base64"));
+    }
+
+    const blocks = ydoc.getMap("blocks");
+    const block = blocks.get(testBlockId) as Y.Map<any>;
+    const text = block.get("prop:text") as Y.Text;
+
+    // Apply comment formatting
+    const commentId = "test-delete-" + Date.now();
+    const selectedText = "Click";
+    const textContent = text.toString();
+    const startIndex = textContent.indexOf(selectedText);
+
+    text.format(startIndex, selectedText.length, { [`comment-${commentId}`]: true });
+    let update = Y.encodeStateAsUpdate(ydoc);
+    await pushDocUpdate(socket, WORKSPACE_ID!, testDocId, Buffer.from(update).toString("base64"));
+
+    // Verify formatting exists
+    const docData2 = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc2 = new Y.Doc();
+    if (docData2.missing) {
+      Y.applyUpdate(ydoc2, Buffer.from(docData2.missing, "base64"));
+    }
+
+    const blocks2 = ydoc2.getMap("blocks");
+    const block2 = blocks2.get(testBlockId) as Y.Map<any>;
+    const text2 = block2.get("prop:text") as Y.Text;
+    let delta = text2.toDelta();
+
+    let hasFormatting = false;
+    for (const op of delta) {
+      if (op.attributes && op.attributes[`comment-${commentId}`]) {
+        hasFormatting = true;
+      }
+    }
+    assert.ok(hasFormatting, "Formatting should exist before delete");
+
+    // Remove formatting
+    let index = 0;
+    for (const op of delta) {
+      const length = typeof op.insert === "string" ? op.insert.length : 1;
+      if (op.attributes && op.attributes[`comment-${commentId}`]) {
+        text2.format(index, length, { [`comment-${commentId}`]: null });
+      }
+      index += length;
+    }
+
+    update = Y.encodeStateAsUpdate(ydoc2);
+    await pushDocUpdate(socket, WORKSPACE_ID!, testDocId, Buffer.from(update).toString("base64"));
+
+    // Verify formatting is removed
+    const docData3 = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc3 = new Y.Doc();
+    if (docData3.missing) {
+      Y.applyUpdate(ydoc3, Buffer.from(docData3.missing, "base64"));
+    }
+
+    const blocks3 = ydoc3.getMap("blocks");
+    const block3 = blocks3.get(testBlockId) as Y.Map<any>;
+    const text3 = block3.get("prop:text") as Y.Text;
+    delta = text3.toDelta();
+
+    let stillHasFormatting = false;
+    for (const op of delta) {
+      if (op.attributes && op.attributes[`comment-${commentId}`]) {
+        stillHasFormatting = true;
+      }
+    }
+    assert.ok(!stillHasFormatting, "Formatting should be removed after delete");
+
+    socket.disconnect();
+  });
+});

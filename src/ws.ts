@@ -14,12 +14,23 @@ export function wsUrlFromGraphQLEndpoint(endpoint: string): string {
 
 export async function connectWorkspaceSocket(wsUrl: string, extraHeaders?: Record<string, string>): Promise<WorkspaceSocket> {
   return new Promise((resolve, reject) => {
-    const socket = io(wsUrl, {
+    const socketOptions: any = {
       transports: ['websocket'],
       path: '/socket.io/',
-      extraHeaders: extraHeaders && Object.keys(extraHeaders).length > 0 ? extraHeaders : undefined,
       autoConnect: true
-    });
+    };
+    
+    // Add auth token if present in headers
+    if (extraHeaders?.Authorization) {
+      socketOptions.auth = { token: extraHeaders.Authorization.replace('Bearer ', '') };
+    }
+    
+    // Add extra headers if present
+    if (extraHeaders && Object.keys(extraHeaders).length > 0) {
+      socketOptions.extraHeaders = extraHeaders;
+    }
+    
+    const socket = io(wsUrl, socketOptions);
     const timeout = setTimeout(() => {
       cleanup();
       socket.disconnect();
