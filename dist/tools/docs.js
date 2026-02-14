@@ -1407,7 +1407,6 @@ export function registerDocTools(server, gql, defaults) {
         },
     };
     server.registerTool("read_doc_as_markdown", readDocAsMarkdownMeta, readDocAsMarkdownHandler);
-    server.registerTool("affine_read_doc_content", readDocAsMarkdownMeta, readDocAsMarkdownHandler);
     // ── write_doc_from_markdown ───────────────────────────────────────────
     const mdParser = new MarkdownIt();
     /** Convert markdown-it inline tokens to a Y.Text with rich formatting deltas */

@@ -1599,7 +1599,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
   };
   server.registerTool("read_doc_as_markdown", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
-  server.registerTool("affine_read_doc_content", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
 
   // ── write_doc_from_markdown ───────────────────────────────────────────
   const mdParser = new MarkdownIt();
