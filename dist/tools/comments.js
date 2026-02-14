@@ -195,7 +195,7 @@ export function registerCommentTools(server, gql, defaults) {
         // If we have workspaceId and docId, try to remove the formatting
         if (workspaceId && parsed.docId) {
             try {
-                await removeCommentFormatting(gql, workspaceId, parsed.docId, parsed.id);
+                await removeCommentFormatting(gql, workspaceId, parsed.docId, parsed.id, parsed.blockId);
             }
             catch (error) {
                 console.error("Failed to remove comment formatting:", error);
@@ -204,7 +204,7 @@ export function registerCommentTools(server, gql, defaults) {
         }
         return text({ success: data.deleteComment });
     };
-    async function removeCommentFormatting(gql, workspaceId, docId, commentId) {
+    async function removeCommentFormatting(gql, workspaceId, docId, commentId, blockId) {
         const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
         const socket = await connectWorkspaceSocket(wsUrl, gql.getAuthHeaders());
         await joinWorkspace(socket, workspaceId);
@@ -213,11 +213,14 @@ export function registerCommentTools(server, gql, defaults) {
         if (docData.missing) {
             Y.applyUpdate(ydoc, Buffer.from(docData.missing, 'base64'));
         }
-        // Search through all blocks to find text with this comment formatting
         const blocks = ydoc.getMap('blocks');
         const commentKey = `comment-${commentId}`;
         let foundAndRemoved = false;
-        blocks.forEach((block, blockId) => {
+        // If blockId is provided, only check that block
+        const blocksToCheck = blockId ? [[blockId, blocks.get(blockId)]] : Array.from(blocks.entries());
+        for (const [bid, block] of blocksToCheck) {
+            if (!block)
+                continue;
             const text = block.get('prop:text');
             if (text) {
                 // Check if this text has the comment formatting
@@ -240,9 +243,12 @@ export function registerCommentTools(server, gql, defaults) {
                         }
                         index += length;
                     }
+                    // If blockId was provided, we can stop after finding it
+                    if (blockId)
+                        break;
                 }
             }
-        });
+        }
         if (foundAndRemoved) {
             const update = Y.encodeStateAsUpdate(ydoc);
             const updateBase64 = Buffer.from(update).toString('base64');
@@ -252,11 +258,12 @@ export function registerCommentTools(server, gql, defaults) {
     }
     server.registerTool("delete_comment", {
         title: "Delete Comment",
-        description: "Delete a comment by id. Optionally provide workspaceId and docId to remove text highlighting.",
+        description: "Delete a comment by id. Optionally provide workspaceId, docId, and blockId to remove text highlighting. Providing blockId significantly speeds up formatting removal.",
         inputSchema: {
             id: z.string(),
             workspaceId: z.string().optional(),
-            docId: z.string().optional()
+            docId: z.string().optional(),
+            blockId: z.string().optional().describe("Block ID where the comment is anchored (speeds up formatting removal)")
         }
     }, deleteCommentHandler);
     const resolveCommentHandler = async (parsed) => {

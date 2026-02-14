@@ -224,7 +224,7 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     updateCommentHandler as any
   );
 
-  const deleteCommentHandler = async (parsed: { id: string; workspaceId?: string; docId?: string }) => {
+  const deleteCommentHandler = async (parsed: { id: string; workspaceId?: string; docId?: string; blockId?: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     
     // Delete the comment first
@@ -234,7 +234,7 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     // If we have workspaceId and docId, try to remove the formatting
     if (workspaceId && parsed.docId) {
       try {
-        await removeCommentFormatting(gql, workspaceId, parsed.docId, parsed.id);
+        await removeCommentFormatting(gql, workspaceId, parsed.docId, parsed.id, parsed.blockId);
       } catch (error) {
         console.error("Failed to remove comment formatting:", error);
         // Don't fail the delete if formatting removal fails
@@ -248,7 +248,8 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     gql: GraphQLClient,
     workspaceId: string,
     docId: string,
-    commentId: string
+    commentId: string,
+    blockId?: string
   ): Promise<void> {
     const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
     const socket = await connectWorkspaceSocket(wsUrl, gql.getAuthHeaders());
@@ -260,12 +261,15 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
       Y.applyUpdate(ydoc, Buffer.from(docData.missing, 'base64'));
     }
     
-    // Search through all blocks to find text with this comment formatting
     const blocks = ydoc.getMap('blocks');
     const commentKey = `comment-${commentId}`;
     let foundAndRemoved = false;
     
-    blocks.forEach((block: any, blockId: string) => {
+    // If blockId is provided, only check that block
+    const blocksToCheck: Array<[string, any]> = blockId ? [[blockId, blocks.get(blockId)]] : Array.from(blocks.entries());
+    
+    for (const [bid, block] of blocksToCheck) {
+      if (!block) continue;
       const text = block.get('prop:text') as Y.Text | undefined;
       if (text) {
         // Check if this text has the comment formatting
@@ -290,9 +294,12 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
             }
             index += length;
           }
+          
+          // If blockId was provided, we can stop after finding it
+          if (blockId) break;
         }
       }
-    });
+    }
     
     if (foundAndRemoved) {
       const update = Y.encodeStateAsUpdate(ydoc);
@@ -306,11 +313,12 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     "delete_comment",
     {
       title: "Delete Comment",
-      description: "Delete a comment by id. Optionally provide workspaceId and docId to remove text highlighting.",
+      description: "Delete a comment by id. Optionally provide workspaceId, docId, and blockId to remove text highlighting. Providing blockId significantly speeds up formatting removal.",
       inputSchema: {
         id: z.string(),
         workspaceId: z.string().optional(),
-        docId: z.string().optional()
+        docId: z.string().optional(),
+        blockId: z.string().optional().describe("Block ID where the comment is anchored (speeds up formatting removal)")
       }
     },
     deleteCommentHandler as any
