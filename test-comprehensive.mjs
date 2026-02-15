@@ -317,7 +317,7 @@ class ComprehensiveTestRunner {
   }
 
   async testCollaborationTools() {
-    console.log('\n💬 COLLABORATION (5 tools)');
+    console.log('\n💬 COLLABORATION (6 tools)');
     const results = {};
     
     if (this.docId) {
@@ -325,10 +325,13 @@ class ComprehensiveTestRunner {
       results['affine_list_comments'] = await this.testTool('affine_list_comments', { docId: this.docId });
       console.log(`  ✅ affine_list_comments`);
       
-      // Create comment
+      // Create single comment
       const createResult = await this.testTool('affine_create_comment', { 
         docId: this.docId, 
-        content: 'Test comment' 
+        content: 'Test comment',
+        blockId: 'test-block',
+        blockText: 'test text',
+        selectedText: 'test'
       });
       results['affine_create_comment'] = createResult;
       
@@ -337,7 +340,18 @@ class ComprehensiveTestRunner {
         const match = text.match(/"id":\s*"([^"]+)"/);
         if (match) this.commentId = match[1];
       }
-      console.log(`  ✅ affine_create_comment`);
+      console.log(`  ✅ affine_create_comment (single)`);
+      
+      // Create batch comments
+      const batchResult = await this.testTool('affine_create_comment', {
+        docId: this.docId,
+        comments: [
+          { content: 'Batch 1', blockId: 'b1', blockText: 'text1', selectedText: 'text1' },
+          { content: 'Batch 2', blockId: 'b2', blockText: 'text2', selectedText: 'text2' }
+        ]
+      });
+      results['affine_create_comment_batch'] = batchResult;
+      console.log(`  ✅ affine_create_comment (batch)`);
       
       if (this.commentId) {
         // Update comment
@@ -367,6 +381,7 @@ class ComprehensiveTestRunner {
     } else {
       results['affine_list_comments'] = { status: 'skipped', reason: 'No doc ID' };
       results['affine_create_comment'] = { status: 'skipped', reason: 'No doc ID' };
+      results['affine_create_comment_batch'] = { status: 'skipped', reason: 'No doc ID' };
       results['affine_update_comment'] = { status: 'skipped', reason: 'No doc ID' };
       results['affine_resolve_comment'] = { status: 'skipped', reason: 'No doc ID' };
       results['affine_delete_comment'] = { status: 'skipped', reason: 'No doc ID' };

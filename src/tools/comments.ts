@@ -29,17 +29,102 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     listCommentsHandler as any
   );
 
-  const createCommentHandler = async (parsed: { workspaceId?: string; docId: string; docTitle?: string; docMode?: "Page"|"Edgeless"|"page"|"edgeless"; content: any; mentions?: string[]; blockId?: string; blockText?: string; selectedText?: string }) => {
+  const createCommentHandler = async (parsed: { workspaceId?: string; docId: string; docTitle?: string; docMode?: "Page"|"Edgeless"|"page"|"edgeless"; content?: any; mentions?: string[]; blockId?: string; blockText?: string; selectedText?: string; comments?: Array<{ content: any; blockId: string; blockText: string; selectedText: string; mentions?: string[] }> }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId || parsed.workspaceId;
     if (!workspaceId) throw new Error("workspaceId required (or set AFFINE_WORKSPACE_ID)");
+    
+    // Batch mode
+    if (parsed.comments) {
+      const normalizedDocMode = (parsed.docMode || 'page').toLowerCase() === 'edgeless' ? 'edgeless' : 'page';
+      const mutation = `mutation CreateComment($input: CommentCreateInput!){ createComment(input:$input){ id content createdAt updatedAt resolved } }`;
+      
+      const createdComments = [];
+      for (const comment of parsed.comments) {
+        let normalizedContent: any;
+        if (typeof comment.content === 'string') {
+          const commentBlockId = `comment-${Date.now()}`;
+          normalizedContent = {
+            mode: normalizedDocMode,
+            preview: comment.selectedText,
+            snapshot: {
+              meta: { id: commentBlockId, tags: [], title: "", createDate: Date.now() },
+              type: "page",
+              blocks: {
+                id: commentBlockId,
+                type: "block",
+                flavour: "affine:page",
+                version: 2,
+                props: { title: { delta: [], "$blocksuite:internal:text$": true } },
+                children: [{
+                  id: `note-${Date.now()}`,
+                  type: "block",
+                  flavour: "affine:note",
+                  version: 1,
+                  props: {
+                    xywh: "[0,0,498,92]",
+                    index: "a0",
+                    hidden: false,
+                    edgeless: {
+                      style: {
+                        borderSize: 4,
+                        shadowType: "--affine-note-shadow-box",
+                        borderStyle: "none",
+                        borderRadius: 8
+                      }
+                    },
+                    background: { light: "#ffffff", dark: "#252525" },
+                    displayMode: "both",
+                    lockedBySelf: false
+                  },
+                  children: [{
+                    id: `para-${Date.now()}`,
+                    type: "block",
+                    flavour: "affine:paragraph",
+                    version: 1,
+                    props: {
+                      type: "text",
+                      text: { delta: [{ insert: comment.content }], "$blocksuite:internal:text$": true },
+                      collapsed: false
+                    },
+                    children: []
+                  }]
+                }]
+              }
+            },
+            attachments: []
+          };
+        } else {
+          normalizedContent = comment.content;
+        }
+        
+        const input = { content: normalizedContent, docId: parsed.docId, workspaceId, docTitle: parsed.docTitle || "", docMode: normalizedDocMode, mentions: comment.mentions };
+        const data = await gql.request<{ createComment: any }>(mutation, { input });
+        createdComments.push({
+          id: data.createComment.id,
+          blockId: comment.blockId,
+          blockText: comment.blockText,
+          selectedText: comment.selectedText,
+          result: data.createComment
+        });
+      }
+      
+      try {
+        await batchApplyCommentFormatting(gql, workspaceId, parsed.docId, createdComments);
+      } catch (error) {
+        console.error("Failed to apply batch comment formatting:", error);
+      }
+      
+      return text({ comments: createdComments.map(c => c.result) });
+    }
+    
+    // Single mode
     const mutation = `mutation CreateComment($input: CommentCreateInput!){ createComment(input:$input){ id content createdAt updatedAt resolved } }`;
     const normalizedDocMode = (parsed.docMode || 'page').toLowerCase() === 'edgeless' ? 'edgeless' : 'page';
     
     let normalizedContent: any;
     if (typeof parsed.content === 'string') {
       const commentBlockId = `comment-${Date.now()}`;
-      // Use selectedText for preview if provided, otherwise blockText, otherwise "normal"
-      const preview = parsed.selectedText || (parsed.blockText ? parsed.blockText.substring(0, 50) : "normal");
+      const preview = parsed.selectedText!;
       normalizedContent = {
         mode: normalizedDocMode,
         preview,
@@ -98,16 +183,10 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     const data = await gql.request<{ createComment: any }>(mutation, { input });
     const commentId = data.createComment.id;
     
-    // If blockId and selectedText are provided, apply comment formatting to the document
-    if (parsed.blockId && parsed.selectedText && parsed.blockText) {
-      try {
-        console.error(`Applying comment formatting: blockId=${parsed.blockId}, selectedText="${parsed.selectedText}", commentId=${commentId}`);
-        await applyCommentFormatting(gql, workspaceId, parsed.docId, parsed.blockId, parsed.blockText, parsed.selectedText, commentId);
-        console.error("Comment formatting applied successfully");
-      } catch (error) {
-        console.error("Failed to apply comment formatting:", error);
-        // Don't fail the whole operation if formatting fails
-      }
+    try {
+      await applyCommentFormatting(gql, workspaceId, parsed.docId, parsed.blockId!, parsed.blockText!, parsed.selectedText!, commentId);
+    } catch (error) {
+      console.error("Failed to apply comment formatting:", error);
     }
     
     return text(data.createComment);
@@ -122,85 +201,111 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     selectedText: string,
     commentId: string
   ): Promise<void> {
-    console.error("Starting applyCommentFormatting...");
-    
-    // Connect to workspace via WebSocket
     const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
-    console.error(`Connecting to WebSocket: ${wsUrl}`);
     const socket = await connectWorkspaceSocket(wsUrl, gql.getAuthHeaders());
-    console.error("WebSocket connected");
     
     await joinWorkspace(socket, workspaceId);
-    console.error(`Joined workspace: ${workspaceId}`);
     
-    // Load the document
     const docData = await loadDoc(socket, workspaceId, docId);
-    console.error(`Loaded doc, has state: ${!!docData.state}`);
     
-    // Create Y.Doc and apply state if available
     const ydoc = new Y.Doc();
     if (docData.missing) {
       const stateUpdate = Buffer.from(docData.missing, 'base64');
       Y.applyUpdate(ydoc, stateUpdate);
-      console.error("Applied doc missing data to Y.Doc");
     }
     
-    // Find the block and its text
     const blocks = ydoc.getMap('blocks');
-    console.error(`Blocks map has ${blocks.size} entries`);
     const block = blocks.get(blockId) as Y.Map<any> | undefined;
     if (!block) {
       socket.disconnect();
       throw new Error(`Block ${blockId} not found in blocks map`);
     }
-    console.error(`Found block ${blockId}`);
     
     const text = block.get('prop:text') as Y.Text | undefined;
     if (!text) {
       socket.disconnect();
       throw new Error(`Block ${blockId} has no prop:text property`);
     }
-    console.error(`Found text in block, content: "${text.toString()}"`);
     
-    // Find the selected text in the block
     const textContent = text.toString();
     const startIndex = textContent.indexOf(selectedText);
     if (startIndex === -1) {
       socket.disconnect();
       throw new Error(`Selected text "${selectedText}" not found in block text "${textContent}"`);
     }
-    console.error(`Found selected text at index ${startIndex}`);
     
-    // Apply comment formatting
     text.format(startIndex, selectedText.length, { [`comment-${commentId}`]: true });
-    console.error(`Applied formatting: comment-${commentId} at ${startIndex}, length ${selectedText.length}`);
     
-    // Push the update
     const update = Y.encodeStateAsUpdate(ydoc);
     const updateBase64 = Buffer.from(update).toString('base64');
-    console.error(`Pushing update, size: ${update.length} bytes`);
     await pushDocUpdate(socket, workspaceId, docId, updateBase64);
-    console.error("Update pushed successfully");
     
-    // Close socket
     socket.disconnect();
-    console.error("Socket disconnected");
   }
+  
+  async function batchApplyCommentFormatting(
+    gql: GraphQLClient,
+    workspaceId: string,
+    docId: string,
+    comments: Array<{ id: string; blockId: string; blockText: string; selectedText: string }>
+  ): Promise<void> {
+    const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, gql.getAuthHeaders());
+    
+    await joinWorkspace(socket, workspaceId);
+    const docData = await loadDoc(socket, workspaceId, docId);
+    
+    const ydoc = new Y.Doc();
+    if (docData.missing) {
+      const stateUpdate = Buffer.from(docData.missing, 'base64');
+      Y.applyUpdate(ydoc, stateUpdate);
+    }
+    
+    const blocks = ydoc.getMap('blocks');
+    
+    for (const comment of comments) {
+      const block = blocks.get(comment.blockId) as Y.Map<any> | undefined;
+      if (!block) continue;
+      
+      const text = block.get('prop:text') as Y.Text | undefined;
+      if (!text) continue;
+      
+      const textContent = text.toString();
+      const startIndex = textContent.indexOf(comment.selectedText);
+      if (startIndex === -1) continue;
+      
+      text.format(startIndex, comment.selectedText.length, { [`comment-${comment.id}`]: true });
+    }
+    
+    const update = Y.encodeStateAsUpdate(ydoc);
+    const updateBase64 = Buffer.from(update).toString('base64');
+    await pushDocUpdate(socket, workspaceId, docId, updateBase64);
+    
+    socket.disconnect();
+  }
+  
   server.registerTool(
     "create_comment",
     {
       title: "Create Comment",
-      description: "Create a comment on a doc. To anchor the comment to a specific text selection, provide blockId, blockText, and selectedText (the exact text fragment to highlight).",
+      description: "Create a comment (or multiple comments) on a doc. Comments must be anchored to a specific text selection. For single comment: provide content, blockId, blockText, selectedText. For batch: provide comments array. Batch mode is much faster for multiple comments.",
       inputSchema: {
         workspaceId: z.string().optional(),
         docId: z.string(),
         docTitle: z.string().optional(),
         docMode: z.enum(["Page","Edgeless","page","edgeless"]).optional(),
-        content: z.any(),
+        content: z.any().optional().describe("Comment content (for single mode)"),
         mentions: z.array(z.string()).optional(),
-        blockId: z.string().optional().describe("Block ID to anchor the comment to"),
-        blockText: z.string().optional().describe("Full text content of the block"),
-        selectedText: z.string().optional().describe("Exact text fragment to highlight (will be used as preview)")
+        blockId: z.string().optional().describe("Block ID to anchor the comment to (for single mode)"),
+        blockText: z.string().optional().describe("Full text content of the block (for single mode)"),
+        selectedText: z.string().optional().describe("Exact text fragment to highlight (for single mode)"),
+        comments: z.array(z.object({
+          content: z.any(),
+          blockId: z.string(),
+          blockText: z.string(),
+          selectedText: z.string(),
+          mentions: z.array(z.string()).optional()
+        })).optional().describe("Array of comments to create (for batch mode)")
       }
     },
     createCommentHandler as any
@@ -428,4 +533,93 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     },
     replyToCommentHandler as any
   );
+
+  const batchCreateCommentsHandler = async (parsed: { workspaceId?: string; docId: string; docTitle?: string; docMode?: "Page"|"Edgeless"|"page"|"edgeless"; comments: Array<{ content: any; blockId: string; blockText: string; selectedText: string; mentions?: string[] }> }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId required (or set AFFINE_WORKSPACE_ID)");
+    
+    const normalizedDocMode = (parsed.docMode || 'page').toLowerCase() === 'edgeless' ? 'edgeless' : 'page';
+    const mutation = `mutation CreateComment($input: CommentCreateInput!){ createComment(input:$input){ id content createdAt updatedAt resolved } }`;
+    
+    // Create all comments via GraphQL first
+    const createdComments = [];
+    for (const comment of parsed.comments) {
+      let normalizedContent: any;
+      if (typeof comment.content === 'string') {
+        const commentBlockId = `comment-${Date.now()}`;
+        normalizedContent = {
+          mode: normalizedDocMode,
+          preview: comment.selectedText,
+          snapshot: {
+            meta: { id: commentBlockId, tags: [], title: "", createDate: Date.now() },
+            type: "page",
+            blocks: {
+              id: commentBlockId,
+              type: "block",
+              flavour: "affine:page",
+              version: 2,
+              props: { title: { delta: [], "$blocksuite:internal:text$": true } },
+              children: [{
+                id: `note-${Date.now()}`,
+                type: "block",
+                flavour: "affine:note",
+                version: 1,
+                props: {
+                  xywh: "[0,0,498,92]",
+                  index: "a0",
+                  hidden: false,
+                  edgeless: {
+                    style: {
+                      borderSize: 4,
+                      shadowType: "--affine-note-shadow-box",
+                      borderStyle: "none",
+                      borderRadius: 8
+                    }
+                  },
+                  background: { light: "#ffffff", dark: "#252525" },
+                  displayMode: "both",
+                  lockedBySelf: false
+                },
+                children: [{
+                  id: `para-${Date.now()}`,
+                  type: "block",
+                  flavour: "affine:paragraph",
+                  version: 1,
+                  props: {
+                    type: "text",
+                    text: { delta: [{ insert: comment.content }], "$blocksuite:internal:text$": true },
+                    collapsed: false
+                  },
+                  children: []
+                }]
+              }]
+            }
+          },
+          attachments: []
+        };
+      } else {
+        normalizedContent = comment.content;
+      }
+      
+      const input = { content: normalizedContent, docId: parsed.docId, workspaceId, docTitle: parsed.docTitle || "", docMode: normalizedDocMode, mentions: comment.mentions };
+      const data = await gql.request<{ createComment: any }>(mutation, { input });
+      createdComments.push({
+        id: data.createComment.id,
+        blockId: comment.blockId,
+        blockText: comment.blockText,
+        selectedText: comment.selectedText,
+        result: data.createComment
+      });
+    }
+    
+    // Apply all formatting in one WebSocket session
+    try {
+      await batchApplyCommentFormatting(gql, workspaceId, parsed.docId, createdComments);
+    } catch (error) {
+      console.error("Failed to apply batch comment formatting:", error);
+    }
+    
+    return text({ comments: createdComments.map(c => c.result) });
+  };
+  
 }
