@@ -1436,4 +1436,65 @@ describe("Comment operations", () => {
 
     socket.disconnect();
   });
+
+  it("should create multiple comments in batch with single WebSocket connection", async () => {
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+
+    const docData = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc = new Y.Doc();
+    if (docData.missing) {
+      Y.applyUpdate(ydoc, Buffer.from(docData.missing, "base64"));
+    }
+
+    const blocks = ydoc.getMap("blocks");
+    const block = blocks.get(testBlockId) as Y.Map<any>;
+    const text = block.get("prop:text") as Y.Text;
+    const textContent = text.toString();
+
+    // Apply multiple comment formats in batch
+    const comments = [
+      { id: `batch-1-${Date.now()}`, selectedText: "Click", startIndex: textContent.indexOf("Click") },
+      { id: `batch-2-${Date.now()}`, selectedText: "anywhere", startIndex: textContent.indexOf("anywhere") },
+      { id: `batch-3-${Date.now()}`, selectedText: "typing", startIndex: textContent.indexOf("typing") }
+    ];
+
+    for (const comment of comments) {
+      assert.notEqual(comment.startIndex, -1, `Text "${comment.selectedText}" should be found`);
+      text.format(comment.startIndex, comment.selectedText.length, { [`comment-${comment.id}`]: true });
+    }
+
+    // Single push for all comments
+    const update = Y.encodeStateAsUpdate(ydoc);
+    await pushDocUpdate(socket, WORKSPACE_ID!, testDocId, Buffer.from(update).toString("base64"));
+
+    // Verify all formatting applied
+    const docData2 = await loadDoc(socket, WORKSPACE_ID!, testDocId);
+    const ydoc2 = new Y.Doc();
+    if (docData2.missing) {
+      Y.applyUpdate(ydoc2, Buffer.from(docData2.missing, "base64"));
+    }
+
+    const blocks2 = ydoc2.getMap("blocks");
+    const block2 = blocks2.get(testBlockId) as Y.Map<any>;
+    const text2 = block2.get("prop:text") as Y.Text;
+    const delta = text2.toDelta();
+
+    const foundComments = new Set<string>();
+    for (const op of delta) {
+      if (op.attributes) {
+        for (const comment of comments) {
+          if (op.attributes[`comment-${comment.id}`]) {
+            foundComments.add(comment.id);
+          }
+        }
+      }
+    }
+
+    assert.equal(foundComments.size, comments.length, "All batch comments should be applied");
+
+    socket.disconnect();
+  });
 });

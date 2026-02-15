@@ -1,0 +1,331 @@
+{
+  "timestamp": "2026-02-15T00:49:21.742Z",
+  "summary": {
+    "totalTools": 50,
+    "successful": 9,
+    "failed": 14,
+    "skipped": 27,
+    "errors": 0,
+    "successRate": "39.1",
+    "coverage": "46.0"
+  },
+  "detailedResults": {
+    "workspace": {
+      "affine_list_workspaces": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_list_workspaces not found",
+        "duration": 6
+      },
+      "affine_create_workspace": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_create_workspace not found",
+        "duration": 2
+      },
+      "affine_get_workspace": {
+        "status": "skipped",
+        "reason": "No workspace ID"
+      },
+      "affine_update_workspace": {
+        "status": "skipped",
+        "reason": "No workspace ID"
+      },
+      "affine_invite_members": {
+        "status": "skipped",
+        "reason": "No workspace ID"
+      },
+      "affine_leave_workspace": {
+        "status": "skipped",
+        "reason": "No workspace ID"
+      },
+      "affine_delete_workspace": {
+        "status": "skipped",
+        "reason": "No workspace ID"
+      }
+    },
+    "document": {
+      "affine_list_docs": {
+        "status": "success",
+        "duration": 2,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment."
+            }
+          ],
+          "isError": true
+        }
+      },
+      "affine_search_docs": {
+        "status": "success",
+        "duration": 1,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment."
+            }
+          ],
+          "isError": true
+        }
+      },
+      "affine_recent_docs": {
+        "status": "success",
+        "duration": 1,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment."
+            }
+          ],
+          "isError": true
+        }
+      },
+      "affine_create_doc": {
+        "status": "success",
+        "duration": 1,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "workspaceId is required. Provide it or set AFFINE_WORKSPACE_ID."
+            }
+          ],
+          "isError": true
+        }
+      },
+      "affine_get_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_update_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_publish_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_revoke_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_duplicate_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_share_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_delete_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_restore_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      }
+    },
+    "collaboration": {
+      "affine_list_comments": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_create_comment": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_create_comment_batch": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_update_comment": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_resolve_comment": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_delete_comment": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      }
+    },
+    "history": {
+      "affine_list_histories": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      },
+      "affine_recover_doc": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      }
+    },
+    "user": {
+      "affine_current_user": {
+        "status": "success",
+        "duration": 24,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "fetch failed"
+            }
+          ],
+          "isError": true
+        }
+      },
+      "affine_sign_in": {
+        "status": "failed",
+        "error": "MCP error -32602: Invalid arguments for tool affine_sign_in: [\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"string\",\n    \"received\": \"undefined\",\n    \"path\": [\n      \"email\"\n    ],\n    \"message\": \"Required\"\n  },\n  {\n    \"code\": \"invalid_type\",\n    \"expected\": \"string\",\n    \"received\": \"undefined\",\n    \"path\": [\n      \"password\"\n    ],\n    \"message\": \"Required\"\n  }\n]",
+        "duration": 1
+      },
+      "affine_update_profile": {
+        "status": "success",
+        "duration": 4,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":\"fetch failed\"}"
+            }
+          ]
+        }
+      },
+      "affine_update_settings": {
+        "status": "success",
+        "duration": 4,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":\"fetch failed\"}"
+            }
+          ]
+        }
+      },
+      "affine_send_verify_email": {
+        "status": "success",
+        "duration": 6,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":\"fetch failed\"}"
+            }
+          ]
+        }
+      },
+      "affine_send_password_reset": {
+        "status": "success",
+        "duration": 5,
+        "result": {
+          "content": [
+            {
+              "type": "text",
+              "text": "{\"error\":\"fetch failed\"}"
+            }
+          ]
+        }
+      },
+      "affine_change_password": {
+        "status": "skipped",
+        "reason": "Requires token"
+      },
+      "affine_delete_account": {
+        "status": "skipped",
+        "reason": "Destructive operation"
+      }
+    },
+    "accessToken": {
+      "affine_list_access_tokens": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_list_access_tokens not found",
+        "duration": 2
+      },
+      "affine_generate_access_token": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_generate_access_token not found",
+        "duration": 1
+      },
+      "affine_revoke_access_token": {
+        "status": "skipped",
+        "reason": "No token ID"
+      }
+    },
+    "blob": {
+      "affine_upload_blob": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_upload_blob not found",
+        "duration": 1
+      },
+      "affine_delete_blob": {
+        "status": "skipped",
+        "reason": "No blob key"
+      },
+      "affine_cleanup_blobs": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_cleanup_blobs not found",
+        "duration": 1
+      }
+    },
+    "notification": {
+      "affine_list_notifications": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_list_notifications not found",
+        "duration": 1
+      },
+      "affine_read_notification": {
+        "status": "skipped",
+        "reason": "No notifications"
+      },
+      "affine_read_all_notifications": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_read_all_notifications not found",
+        "duration": 0
+      }
+    },
+    "advanced": {
+      "affine_apply_doc_updates": {
+        "status": "skipped",
+        "reason": "No doc ID"
+      }
+    },
+    "realtime": {
+      "affine_realtime_connect": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_realtime_connect not found",
+        "duration": 1
+      },
+      "affine_realtime_create_doc": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_realtime_create_doc not found",
+        "duration": 1
+      },
+      "affine_realtime_update_doc": {
+        "status": "skipped",
+        "reason": "No realtime doc created"
+      }
+    },
+    "experimental": {
+      "affine_experimental_create_workspace": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_experimental_create_workspace not found",
+        "duration": 0
+      },
+      "affine_experimental_init_doc": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_experimental_init_doc not found",
+        "duration": 0
+      },
+      "affine_experimental_clone_doc": {
+        "status": "failed",
+        "error": "MCP error -32602: Tool affine_experimental_clone_doc not found",
+        "duration": 1
+      }
+    }
+  }
+}
