@@ -784,6 +784,80 @@ describe("integration", () => {
     assert.deepEqual(childIds3, [aId, bId, cId], "block IDs should be preserved");
   });
 
+  it("update_doc_markdown works with headings and sections (blank-line consistency)", async () => {
+    // This test reproduces the bug where blocksToMarkdownWithMap collapsed
+    // consecutive blank lines, making the rendered markdown non-deterministic
+    // and causing old_markdown matching to fail.
+    const { ydoc, docId, noteId } = createEmptyDoc("Blank Line Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = note.get("sys:children") as Y.Array<any>;
+
+    function addBlock(flavour: string, text: string, type?: string) {
+      const id = genId();
+      const b = new Y.Map();
+      setSys(b, id, flavour);
+      b.set("sys:parent", noteId);
+      b.set("sys:children", new Y.Array());
+      if (type) b.set("prop:type", type);
+      const yt = new Y.Text(); yt.insert(0, text);
+      b.set("prop:text", yt);
+      blocks.set(id, b);
+      noteChildren.push([id]);
+      return id;
+    }
+
+    // Create a doc structure similar to the real prompt doc:
+    // heading, paragraph, heading, paragraph
+    addBlock("affine:paragraph", "Goal", "h2");
+    addBlock("affine:paragraph", "Analyze the data carefully.", "text");
+    addBlock("affine:paragraph", "Inputs", "h2");
+    addBlock("affine:paragraph", "JSON files are required.", "text");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read the doc as markdown (simulating read_doc_as_markdown)
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    const noteBlock2 = findByFlavour(blocks2, "affine:note")!;
+
+    // Inline a minimal blocksToMarkdownWithMap to get the rendered markdown
+    const lines: string[] = [];
+    lines.push("# Blank Line Test", "");
+    const childIds: string[] = [];
+    (noteBlock2.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+    for (const cid of childIds) {
+      const b = blocks2.get(cid) as Y.Map<any>;
+      const flavour = b.get("sys:flavour") as string;
+      const type = b.get("prop:type") as string;
+      const txt = b.get("prop:text")?.toString() || "";
+      if (flavour === "affine:paragraph" && type?.startsWith("h")) {
+        const level = parseInt(type[1], 10);
+        lines.push(`${"#".repeat(level)} ${txt}`, "");
+      } else {
+        lines.push(txt, "");
+      }
+    }
+    // Trim trailing blank lines
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const renderedMd = lines.join("\n") + "\n";
+
+    // The key assertion: the old_markdown substring must be findable
+    const oldSnippet = "## Goal\n\nAnalyze the data carefully.";
+    const idx = renderedMd.indexOf(oldSnippet);
+    assert.ok(idx !== -1, `Should find old_markdown in rendered markdown. Got:\n${renderedMd}`);
+    assert.equal(renderedMd.indexOf(oldSnippet, idx + 1), -1, "Should match only once");
+
+    // Simulate the str_replace
+    const newSnippet = "## Goal\n\nAnalyze the data very carefully.";
+    const patched = renderedMd.slice(0, idx) + newSnippet + renderedMd.slice(idx + oldSnippet.length);
+    assert.ok(patched.includes("very carefully"), "Patched markdown should contain replacement");
+    assert.ok(patched.includes("## Inputs"), "Unaffected sections should be preserved");
+  });
+
   it("move_block reorders and reparents blocks", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Move Block Test");
     docsToCleanup.push(docId);

@@ -2122,35 +2122,16 @@ export function registerDocTools(server, gql, defaults) {
             blockLineRanges.push({ blockId: childId, startLine, endLine: lines.length });
             prevWasList = isList;
         }
-        // Collapse consecutive blank lines
-        const collapsed = [];
-        // Map from collapsed line index → original line index
-        const collapseMap = [];
-        for (let i = 0; i < lines.length; i++) {
-            if (lines[i] === "" && collapsed.length > 0 && collapsed[collapsed.length - 1] === "")
-                continue;
-            collapsed.push(lines[i]);
-            collapseMap.push(i);
+        // Remove trailing blank lines only
+        while (lines.length > 0 && lines[lines.length - 1] === "") {
+            lines.pop();
+            // Adjust blockLineRanges if their endLine pointed past the removed lines
+            for (const range of blockLineRanges) {
+                if (range.endLine > lines.length)
+                    range.endLine = lines.length;
+            }
         }
-        while (collapsed.length > 0 && collapsed[collapsed.length - 1] === "") {
-            collapsed.pop();
-            collapseMap.pop();
-        }
-        // Remap blockLineRanges to collapsed line numbers
-        // Build reverse map: original line → collapsed line
-        const reverseMap = new Array(lines.length).fill(-1);
-        for (let ci = 0; ci < collapseMap.length; ci++)
-            reverseMap[collapseMap[ci]] = ci;
-        // For lines that were collapsed away, map to the next valid collapsed line
-        for (let i = lines.length - 1; i >= 0; i--) {
-            if (reverseMap[i] === -1)
-                reverseMap[i] = i + 1 < lines.length ? reverseMap[i + 1] : collapseMap.length;
-        }
-        for (const range of blockLineRanges) {
-            range.startLine = reverseMap[range.startLine] ?? range.startLine;
-            range.endLine = reverseMap[range.endLine] !== undefined ? reverseMap[range.endLine] : range.endLine;
-        }
-        return { markdown: collapsed.join("\n") + "\n", blockLineRanges };
+        return { markdown: lines.join("\n") + "\n", blockLineRanges };
     }
     // ── update_block (edit block text/properties in-place) ────────────────
     const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
@@ -2607,11 +2588,15 @@ export function registerDocTools(server, gql, defaults) {
             }
             // Parse new region and collect new block IDs
             const tempNoteId = generateId();
-            const tempChildren = new Y.Array();
+            const tempNoteBlock = new Y.Map();
+            tempNoteBlock.set("sys:children", new Y.Array());
+            blocks.set(tempNoteId, tempNoteBlock);
+            const tempChildren = tempNoteBlock.get("sys:children");
             const mdTokens = mdParser.parse(newRegionMd, {});
             markdownToBlocks(mdTokens, tempNoteId, blocks, tempChildren);
             // Insert new blocks into real note at insertIdx
             const newBlockIds = childIdsFrom(tempChildren);
+            blocks.delete(tempNoteId); // clean up temp block
             for (let i = 0; i < newBlockIds.length; i++) {
                 const bid = newBlockIds[i];
                 const block = blocks.get(bid);
