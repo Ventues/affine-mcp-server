@@ -3217,6 +3217,111 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     appendBlockHandler as any
   );
 
+  // APPEND BLOCKS (batch – multiple blocks in one transaction)
+  type AppendBlockEntry = Omit<AppendBlockInput, 'workspaceId' | 'docId'>;
+
+  const appendBlocksHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    blocks: AppendBlockEntry[];
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+    if (!parsed.blocks || parsed.blocks.length === 0) throw new Error("blocks array is required and must not be empty");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (snapshot.missing) {
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      }
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const results: { blockId: string; flavour: string; type: string | null; normalizedType: string; legacyType: string | null }[] = [];
+
+      for (const entry of parsed.blocks) {
+        const normalized = normalizeAppendBlockInput({ ...entry, workspaceId, docId: parsed.docId });
+        const context = resolveInsertContext(blocks, normalized);
+        const { blockId, block, flavour, blockType } = createBlock(context.parentId, normalized);
+        blocks.set(blockId, block);
+        if (context.insertIndex >= context.children.length) {
+          context.children.push([blockId]);
+        } else {
+          context.children.insert(context.insertIndex, [blockId]);
+        }
+        results.push({
+          blockId,
+          flavour,
+          type: blockType || null,
+          normalizedType: normalized.type,
+          legacyType: normalized.legacyType || null,
+        });
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+      await touchDocMeta(socket, workspaceId, parsed.docId);
+
+      return text({ appended: results.length, blocks: results });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const appendBlockEntrySchema = z.object({
+    type: z.string().min(1).describe("Block type (same types as append_block)"),
+    text: z.string().optional(),
+    url: z.string().optional(),
+    pageId: z.string().optional(),
+    iframeUrl: z.string().optional(),
+    html: z.string().optional(),
+    design: z.string().optional(),
+    reference: z.string().optional(),
+    refFlavour: z.string().optional(),
+    width: z.number().int().min(1).max(10000).optional(),
+    height: z.number().int().min(1).max(10000).optional(),
+    background: z.string().optional(),
+    sourceId: z.string().optional(),
+    name: z.string().optional(),
+    mimeType: z.string().optional(),
+    size: z.number().optional(),
+    embed: z.boolean().optional(),
+    rows: z.number().int().min(1).max(20).optional(),
+    columns: z.number().int().min(1).max(20).optional(),
+    latex: z.string().optional(),
+    level: z.number().int().min(1).max(6).optional(),
+    style: AppendBlockListStyle.optional(),
+    bookmarkStyle: AppendBlockBookmarkStyle.optional(),
+    checked: z.boolean().optional(),
+    language: z.string().optional(),
+    caption: z.string().optional(),
+    strict: z.boolean().optional(),
+    placement: z.object({
+      parentId: z.string().optional(),
+      afterBlockId: z.string().optional(),
+      beforeBlockId: z.string().optional(),
+      index: z.number().int().min(0).optional(),
+    }).optional(),
+  });
+
+  const appendBlocksMeta = {
+    title: "Append Multiple Blocks",
+    description: "Append multiple blocks to a document in a single transaction. Much faster than calling append_block multiple times. Each block entry accepts the same properties as append_block (type, text, url, etc). Blocks are appended in order.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      blocks: z.array(appendBlockEntrySchema).min(1).describe("Array of block definitions to append. Each entry has the same shape as append_block params (minus workspaceId/docId)."),
+    },
+  };
+  server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler as any);
+  server.registerTool("affine_append_blocks", appendBlocksMeta, appendBlocksHandler as any);
+
   // DELETE DOC (single or batch)
   const deleteDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;

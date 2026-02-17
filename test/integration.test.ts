@@ -1472,6 +1472,86 @@ describe("integration", () => {
       assert.equal(txt, expected[i], `block ${i} should be ${expected[i]}`);
     }
   });
+
+  it("escaped pipe round-trip: \\| in markdown table cells", async () => {
+    // WRITE PATH: markdown with \| → table cell should contain literal |
+    const { ydoc: ydoc1, docId: docId1, noteId: noteId1 } = createEmptyDoc("Pipe Escape Write Test");
+    docsToCleanup.push(docId1);
+
+    const blocks1 = ydoc1.getMap("blocks") as Y.Map<any>;
+    const note1 = blocks1.get(noteId1) as Y.Map<any>;
+    const noteChildren1 = note1.get("sys:children") as Y.Array<any>;
+
+    // Simulate write_doc_from_markdown: parse markdown with \| and create table
+    const PIPE_PLACEHOLDER = "\uE000PIPE\uE000";
+    const inputMd = "| Metric | Value |\n|---|---|\n| Avg \\|Change\\| | $136 |";
+    const escapedMd = inputMd.replace(/\\\|/g, PIPE_PLACEHOLDER);
+    const md = new MarkdownIt({ linkify: true });
+    const tokens = md.parse(escapedMd, {});
+    assert.ok(tokens.some((t: any) => t.type === "table_open"), "should parse as 2-column table");
+
+    // Verify the placeholder survives tokenization and ends up in inline content
+    const inlineTokens: any[] = [];
+    for (const t of tokens) {
+      if (t.type === "inline" && t.children) {
+        for (const c of t.children) {
+          if (c.content.includes(PIPE_PLACEHOLDER)) inlineTokens.push(c);
+        }
+      }
+    }
+    assert.ok(inlineTokens.length > 0, "placeholder should appear in inline token content");
+    // After unescaping, the cell text should contain literal |
+    const restored = inlineTokens[0].content.replace(new RegExp(PIPE_PLACEHOLDER, "g"), "|");
+    assert.ok(restored.includes("|Change|"), "unescaped content should have literal pipes");
+
+    // READ PATH: table cell with literal | → markdown should have \|
+    const { ydoc: ydoc2, docId: docId2, noteId: noteId2 } = createEmptyDoc("Pipe Escape Read Test");
+    docsToCleanup.push(docId2);
+
+    const blocks2 = ydoc2.getMap("blocks") as Y.Map<any>;
+    const note2 = blocks2.get(noteId2) as Y.Map<any>;
+    const noteChildren2 = note2.get("sys:children") as Y.Array<any>;
+
+    // Create table with literal | in cell content
+    const tblId = genId();
+    const tbl = new Y.Map();
+    setSys(tbl, tblId, "affine:table");
+    tbl.set("sys:parent", noteId2);
+    tbl.set("sys:children", new Y.Array());
+
+    const r0 = genId(), r1 = genId();
+    const c0 = genId(), c1 = genId();
+    tbl.set(`prop:rows.${r0}.rowId`, r0);
+    tbl.set(`prop:rows.${r0}.order`, "a00");
+    tbl.set(`prop:rows.${r1}.rowId`, r1);
+    tbl.set(`prop:rows.${r1}.order`, "a01");
+    tbl.set(`prop:columns.${c0}.columnId`, c0);
+    tbl.set(`prop:columns.${c0}.order`, "a00");
+    tbl.set(`prop:columns.${c1}.columnId`, c1);
+    tbl.set(`prop:columns.${c1}.order`, "a01");
+
+    const mkText = (s: string) => { const t = new Y.Text(); t.insert(0, s); return t; };
+    tbl.set(`prop:cells.${r0}:${c0}.text`, mkText("Metric"));
+    tbl.set(`prop:cells.${r0}:${c1}.text`, mkText("Value"));
+    tbl.set(`prop:cells.${r1}:${c0}.text`, mkText("Avg |Change|"));
+    tbl.set(`prop:cells.${r1}:${c1}.text`, mkText("$136"));
+
+    blocks2.set(tblId, tbl);
+    noteChildren2.push([tblId]);
+
+    await pushDoc(socket, docId2, ydoc2);
+
+    // Read back and simulate blocksToMarkdown table export
+    const readBack = await readBlocks(socket, docId2);
+    const readTbl = readBack.get(tblId) as Y.Map<any>;
+    assert.ok(readTbl, "table block should exist");
+
+    // Read cell with pipe and verify it gets escaped
+    const cellText = (readTbl.get(`prop:cells.${r1}:${c0}.text`) as Y.Text).toString();
+    assert.equal(cellText, "Avg |Change|", "cell should contain literal pipes");
+    const escapedCell = cellText.replace(/\|/g, "\\|");
+    assert.equal(escapedCell, "Avg \\|Change\\|", "exported markdown should escape pipes");
+  });
 });
 
 
