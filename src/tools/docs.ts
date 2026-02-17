@@ -1545,7 +1545,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   );
 
   // ── read_doc_as_markdown ──────────────────────────────────────────────
-  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; includeBlockIds?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }) => {
+  const readDocAsMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; includeBlockIds?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[]; headingsOnly?: boolean }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) {
       throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -1579,9 +1579,26 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
         return text({ docId: parsed.docId, exists: true, title, markdown: title ? `# ${title}\n` : "" });
       }
 
-      // Determine block subset if pagination/filter requested
       const allChildIds = childIdsFrom(noteBlock.get("sys:children"));
       const totalBlocks = allChildIds.length;
+
+      // headingsOnly: return just the outline (heading blocks with IDs, levels, text)
+      if (parsed.headingsOnly) {
+        const headings: { blockId: string; level: number; text: string; blockIndex: number }[] = [];
+        for (let i = 0; i < allChildIds.length; i++) {
+          const raw = blocks.get(allChildIds[i]);
+          if (!(raw instanceof Y.Map)) continue;
+          if (raw.get("sys:flavour") !== "affine:paragraph") continue;
+          const t = raw.get("prop:type") as string | undefined;
+          if (!t || !t.startsWith("h") || t.length !== 2) continue;
+          const level = parseInt(t[1], 10);
+          if (level < 1 || level > 6) continue;
+          headings.push({ blockId: allChildIds[i], level, text: richTextToMarkdown(raw.get("prop:text")), blockIndex: i });
+        }
+        return text({ docId: parsed.docId, exists: true, title, totalBlocks, headings });
+      }
+
+      // Determine block subset if pagination/filter requested
       let selectedIds: string[] | undefined;
 
       if (parsed.blockIds && parsed.blockIds.length > 0) {
@@ -1620,13 +1637,18 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   const readDocAsMarkdownMeta = {
     title: "Read Document as Markdown",
-    description: "Read a document and return its content as a markdown string. Supports pagination with blockOffset/blockLimit to read N blocks at a time, or blockIds to read specific blocks. Set includeBlockIds=true to get a blockMap array mapping each top-level block to its line range.",
+    description: `Read a document as markdown. RECOMMENDED WORKFLOW for editing a specific section of a large doc:
+1. Call with headingsOnly=true first to get the document outline (~10x cheaper).
+2. Use the returned blockIndex values with blockOffset/blockLimit to read just the target section.
+3. Edit using update_doc_markdown or block-level tools.
+Supports pagination with blockOffset/blockLimit, or blockIds to read specific blocks. Set includeBlockIds=true to get block IDs mapped to line ranges.`,
     inputSchema: {
       workspaceId: WorkspaceId.optional(),
       docId: DocId,
+      headingsOnly: z.boolean().optional().describe("Return only the document outline: heading blocks with blockId, level, text, and blockIndex. Use this FIRST to discover section locations before targeted reads. Much cheaper than reading the full document."),
       includeBlockIds: z.boolean().optional().describe("If true, includes blockMap array with block IDs and line ranges for each top-level block."),
-      blockOffset: z.number().int().min(0).optional().describe("Skip this many blocks from the start (0-based). Use with blockLimit for pagination."),
-      blockLimit: z.number().int().min(1).optional().describe("Max number of blocks to return. Use with blockOffset for pagination."),
+      blockOffset: z.number().int().min(0).optional().describe("Skip this many blocks from the start (0-based). Use with blockLimit for pagination. The blockIndex from headingsOnly tells you where each section starts."),
+      blockLimit: z.number().int().min(1).optional().describe("Max number of blocks to return starting from blockOffset."),
       blockIds: z.array(z.string()).optional().describe("Only return markdown for these specific block IDs."),
     },
   };
@@ -1634,6 +1656,13 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   // ── write_doc_from_markdown ───────────────────────────────────────────
   const mdParser = new MarkdownIt({ linkify: true });
+
+  // Escaped-pipe support: \| in markdown table cells → literal pipe in AFFiNE
+  const PIPE_PLACEHOLDER = "\uE000PIPE\uE000";
+  /** Pre-process markdown: replace \| with placeholder so markdown-it doesn't split on it */
+  function escapePipes(md: string): string { return md.replace(/\\\|/g, PIPE_PLACEHOLDER); }
+  /** Restore placeholders back to literal | in a string */
+  function unescapePipes(s: string): string { return s.replace(new RegExp(PIPE_PLACEHOLDER, "g"), "|"); }
 
   /** Convert markdown-it inline tokens to a Y.Text with rich formatting deltas */
   function makeRichText(children: Token[] | null): Y.Text {
@@ -1647,12 +1676,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       switch (tok.type) {
         case "text":
         case "softbreak": {
-          const t = tok.type === "softbreak" ? "\n" : tok.content;
+          const t = tok.type === "softbreak" ? "\n" : unescapePipes(tok.content);
           if (t) segments.push({ text: t, attrs: { ...active } });
           break;
         }
         case "code_inline":
-          segments.push({ text: tok.content, attrs: { code: true } });
+          segments.push({ text: unescapePipes(tok.content), attrs: { code: true } });
           allKeys.add("code");
           break;
         case "strong_open": active.bold = true; allKeys.add("bold"); break;
@@ -2060,7 +2089,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const tempKey = `__temp_${Date.now()}`;
       const tempChildren = new Y.Array<string>();
       doc.getMap("__temp").set(tempKey, tempChildren);
-      const mdTokens = mdParser.parse(md, {});
+      const mdTokens = mdParser.parse(escapePipes(md), {});
       markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
 
       // Insert new blocks at the replace position
@@ -2205,7 +2234,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
               return "";
             };
             for (let r = 0; r < sortedRowIds.length; r++) {
-              const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid));
+              const cells = sortedColIds.map(cid => readCell(sortedRowIds[r], cid).replace(/\|/g, "\\|"));
               lines.push(`| ${cells.join(" | ")} |`);
               if (r === 0) lines.push(`|${sortedColIds.map(() => " --- ").join("|")}|`);
             }
@@ -2784,7 +2813,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       tempNoteBlock.set("sys:children", new Y.Array<string>());
       blocks.set(tempNoteId, tempNoteBlock);
       const tempChildren = tempNoteBlock.get("sys:children") as Y.Array<string>;
-      const mdTokens = mdParser.parse(newRegionMd, {});
+      const mdTokens = mdParser.parse(escapePipes(newRegionMd), {});
       markdownToBlocks(mdTokens, tempNoteId, blocks, tempChildren);
 
       // Insert new blocks into real note at insertIdx
@@ -2813,7 +2842,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
   const updateDocMarkdownMeta = {
     title: "Update Document Markdown",
-    description: "Partial doc update using str_replace style. Reads the doc as markdown, finds the old_markdown substring (must match exactly once), replaces it with new_markdown, and writes back. Use dryRun=true to preview changes. Only send the changed section — avoids rewriting the entire doc.",
+    description: "Partial doc update using str_replace style. Reads the doc as markdown, finds the old_markdown substring (must match exactly once), replaces it with new_markdown, and writes back. Use dryRun=true to preview changes. Only send the changed section — avoids rewriting the entire doc. TIP: Use read_doc_as_markdown with headingsOnly=true first to find the section, then read just that section to get the exact old_markdown text.",
     inputSchema: {
       workspaceId: WorkspaceId.optional(),
       docId: DocId,
@@ -2962,7 +2991,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
 
       if (parsed.content) {
         // Parse content as markdown into rich blocks
-        const mdTokens = mdParser.parse(parsed.content, {});
+        const mdTokens = mdParser.parse(escapePipes(parsed.content), {});
         markdownToBlocks(mdTokens, noteId, blocks, noteChildren);
       }
 
