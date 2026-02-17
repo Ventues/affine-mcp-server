@@ -1633,7 +1633,7 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   server.registerTool("read_doc_as_markdown", readDocAsMarkdownMeta, readDocAsMarkdownHandler as any);
 
   // ── write_doc_from_markdown ───────────────────────────────────────────
-  const mdParser = new MarkdownIt();
+  const mdParser = new MarkdownIt({ linkify: true });
 
   /** Convert markdown-it inline tokens to a Y.Text with rich formatting deltas */
   function makeRichText(children: Token[] | null): Y.Text {

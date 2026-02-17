@@ -5,6 +5,33 @@ import { text } from "../util/mcp.js";
 import * as Y from "yjs";
 import { connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, wsUrlFromGraphQLEndpoint } from "../ws.js";
 
+async function touchDocTimestamp(gql: GraphQLClient, workspaceId: string, docId: string): Promise<void> {
+  const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
+  const socket = await connectWorkspaceSocket(wsUrl, gql.getAuthHeaders());
+  try {
+    await joinWorkspace(socket, workspaceId);
+    const wsSnapshot = await loadDoc(socket, workspaceId, workspaceId);
+    const wsDoc = new Y.Doc();
+    if (wsSnapshot.missing) Y.applyUpdate(wsDoc, Buffer.from(wsSnapshot.missing, 'base64'));
+    const prevSV = Y.encodeStateVector(wsDoc);
+    const wsMeta = wsDoc.getMap('meta');
+    const pages = wsMeta.get('pages') as Y.Array<Y.Map<any>> | undefined;
+    if (pages) {
+      pages.forEach((entry: any) => {
+        if (entry?.get && entry.get('id') === docId) {
+          entry.set('updatedDate', Date.now());
+        }
+      });
+    }
+    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+    if (delta.byteLength > 0) {
+      await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(delta).toString('base64'));
+    }
+  } finally {
+    socket.disconnect();
+  }
+}
+
 export function registerCommentTools(server: McpServer, gql: GraphQLClient, defaults: { workspaceId?: string }) {
   const listCommentsHandler = async (parsed: { workspaceId?: string; docId: string; first?: number; offset?: number; after?: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId || parsed.workspaceId;
@@ -114,6 +141,8 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
         console.error("Failed to apply batch comment formatting:", error);
       }
       
+      try { await touchDocTimestamp(gql, workspaceId, parsed.docId); } catch {}
+      
       return text({ comments: createdComments.map(c => c.result) });
     }
     
@@ -188,6 +217,8 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     } catch (error) {
       console.error("Failed to apply comment formatting:", error);
     }
+    
+    try { await touchDocTimestamp(gql, workspaceId, parsed.docId); } catch {}
     
     return text(data.createComment);
   };
@@ -618,6 +649,8 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     } catch (error) {
       console.error("Failed to apply batch comment formatting:", error);
     }
+    
+    try { await touchDocTimestamp(gql, workspaceId, parsed.docId); } catch {}
     
     return text({ comments: createdComments.map(c => c.result) });
   };

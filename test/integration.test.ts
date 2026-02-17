@@ -126,6 +126,51 @@ async function pushDoc(socket: any, docId: string, ydoc: Y.Doc) {
   await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
 }
 
+/** Delete doc CRDT data AND remove from workspace meta pages list */
+async function cleanupDoc(socket: any, docId: string) {
+  wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+  const wsDoc = new Y.Doc();
+  const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+  if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+  const prevSV = Y.encodeStateVector(wsDoc);
+  const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>> | undefined;
+  if (pages) {
+    for (let i = pages.length - 1; i >= 0; i--) {
+      const entry = pages.get(i);
+      if (entry instanceof Y.Map && entry.get("id") === docId) {
+        pages.delete(i, 1);
+      }
+    }
+  }
+  const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+  if (delta.byteLength > 0) {
+    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+  }
+}
+
+/** Batch cleanup: remove multiple docs from CRDT + workspace meta in one pass */
+async function cleanupDocs(socket: any, docIds: string[]) {
+  for (const docId of docIds) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+  const wsDoc = new Y.Doc();
+  const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+  if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+  const prevSV = Y.encodeStateVector(wsDoc);
+  const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>> | undefined;
+  const idSet = new Set(docIds);
+  if (pages) {
+    for (let i = pages.length - 1; i >= 0; i--) {
+      const entry = pages.get(i);
+      if (entry instanceof Y.Map && idSet.has(entry.get("id"))) {
+        pages.delete(i, 1);
+      }
+    }
+  }
+  const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+  if (delta.byteLength > 0) {
+    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+  }
+}
+
 async function readBlocks(socket: any, docId: string): Promise<Y.Map<any>> {
   const snapshot = await loadDoc(socket, WORKSPACE_ID!, docId);
   const doc = new Y.Doc();
@@ -1472,11 +1517,8 @@ describe("Comment operations", () => {
   after(async () => {
     // Clean up test document
     if (testDocId) {
-      const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
-        Authorization: `Bearer ${TOKEN}`,
-      });
-      await joinWorkspace(socket, WORKSPACE_ID!);
-      await wsDeleteDoc(socket, WORKSPACE_ID!, testDocId);
+      const socket = await connect();
+      await cleanupDoc(socket, testDocId);
       socket.disconnect();
     }
   });
@@ -1816,7 +1858,7 @@ describe("Comment operations", () => {
       console.log(`  batch revoked ${ids.length} docs`);
 
       // Clean up: delete the published docs
-      for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+      await cleanupDocs(socket, ids);
     } finally {
       socket.disconnect();
     }
