@@ -152,6 +152,57 @@ function noteChildFlavours(blocks: Y.Map<any>): string[] {
   });
 }
 
+// ── Shared block builders ───────────────────────────────────────────────
+function addPara(blocks: Y.Map<any>, noteId: string, noteChildren: Y.Array<any>, text: string, type = "text") {
+  const id = genId();
+  const b = new Y.Map();
+  setSys(b, id, "affine:paragraph");
+  b.set("sys:parent", noteId);
+  b.set("sys:children", new Y.Array());
+  b.set("prop:type", type);
+  const yt = new Y.Text(); yt.insert(0, text);
+  b.set("prop:text", yt);
+  blocks.set(id, b);
+  noteChildren.push([id]);
+  return id;
+}
+
+function addBlockTo(blocks: Y.Map<any>, noteId: string, noteChildren: Y.Array<any>, flavour: string, text: string, type?: string) {
+  const id = genId();
+  const b = new Y.Map();
+  setSys(b, id, flavour);
+  b.set("sys:parent", noteId);
+  b.set("sys:children", new Y.Array());
+  if (type) b.set("prop:type", type);
+  const yt = new Y.Text(); yt.insert(0, text);
+  b.set("prop:text", yt);
+  blocks.set(id, b);
+  noteChildren.push([id]);
+  return id;
+}
+
+/** Load doc, apply mutation, push delta — eliminates repeated load/encode/push boilerplate. */
+async function mutateDoc(socket: any, docId: string, fn: (doc: Y.Doc, blocks: Y.Map<any>) => void) {
+  const doc = new Y.Doc();
+  const snap = await loadDoc(socket, WORKSPACE_ID!, docId);
+  if (snap.missing) Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+  const prevSV = Y.encodeStateVector(doc);
+  fn(doc, doc.getMap("blocks") as Y.Map<any>);
+  const delta = Y.encodeStateAsUpdate(doc, prevSV);
+  await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
+}
+
+function getNoteChildIds(blocks: Y.Map<any>): string[] {
+  const note = findByFlavour(blocks, "affine:note")!;
+  const ids: string[] = [];
+  (note.get("sys:children") as Y.Array<any>).forEach((id: string) => ids.push(id));
+  return ids;
+}
+
+function getBlockText(blocks: Y.Map<any>, blockId: string): string {
+  return (blocks.get(blockId) as Y.Map<any>)?.get("prop:text")?.toString() || "";
+}
+
 // ── Cleanup tracker ─────────────────────────────────────────────────────
 const docsToCleanup: string[] = [];
 
@@ -380,79 +431,31 @@ describe("integration", () => {
   });
 
   it("update_doc_markdown round-trip via WS", async () => {
-    // 1. Create doc with content
     const { ydoc, docId, noteId } = createEmptyDoc("Patch Test");
     docsToCleanup.push(docId);
-
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
-
-    // Add two paragraphs
-    function addPara(text: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, "affine:paragraph");
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      b.set("prop:type", "text");
-      const yt = new Y.Text();
-      yt.insert(0, text);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-    }
-    addPara("Hello world");
-    addPara("Goodbye world");
+    const nc = note.get("sys:children") as Y.Array<any>;
+    addPara(blocks, noteId, nc, "Hello world");
+    addPara(blocks, noteId, nc, "Goodbye world");
 
     await pushDoc(socket, docId, ydoc);
 
-    // 2. Read back and verify both paragraphs exist
     const blocks2 = await readBlocks(socket, docId);
-    const flavours = noteChildFlavours(blocks2);
-    assert.equal(flavours.length, 2);
+    assert.equal(noteChildFlavours(blocks2).length, 2);
 
-    // 3. Simulate update_doc_markdown: read text, str_replace, write back
-    // Read all paragraph texts
-    const noteBlock = findByFlavour(blocks2, "affine:note")!;
-    const childIds: string[] = [];
-    (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
-    const texts = childIds.map((id) => {
-      const b = blocks2.get(id) as Y.Map<any>;
-      return b.get("prop:text")?.toString() || "";
-    });
-    assert.ok(texts.includes("Hello world"));
-    assert.ok(texts.includes("Goodbye world"));
-
-    // 4. Patch: replace "Goodbye world" with "Updated world" at Y.Doc level
-    const doc3 = new Y.Doc();
-    const snap3 = await loadDoc(socket, WORKSPACE_ID!, docId);
-    Y.applyUpdate(doc3, Buffer.from(snap3.missing!, "base64"));
-    const prevSV = Y.encodeStateVector(doc3);
-    const blocks3 = doc3.getMap("blocks") as Y.Map<any>;
-    const note3 = findByFlavour(blocks3, "affine:note")!;
-    const kids3: string[] = [];
-    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => kids3.push(id));
-    for (const kid of kids3) {
-      const b = blocks3.get(kid) as Y.Map<any>;
-      const yt = b.get("prop:text") as Y.Text | undefined;
-      if (yt && yt.toString() === "Goodbye world") {
-        yt.delete(0, yt.length);
-        yt.insert(0, "Updated world");
+    await mutateDoc(socket, docId, (_doc, blocks3) => {
+      for (const kid of getNoteChildIds(blocks3)) {
+        const yt = (blocks3.get(kid) as Y.Map<any>).get("prop:text") as Y.Text | undefined;
+        if (yt && yt.toString() === "Goodbye world") {
+          yt.delete(0, yt.length);
+          yt.insert(0, "Updated world");
+        }
       }
-    }
-    const delta = Y.encodeStateAsUpdate(doc3, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
-
-    // 5. Read back and verify patch applied
-    const blocks4 = await readBlocks(socket, docId);
-    const note4 = findByFlavour(blocks4, "affine:note")!;
-    const kids4: string[] = [];
-    (note4.get("sys:children") as Y.Array<any>).forEach((id: string) => kids4.push(id));
-    const texts4 = kids4.map((id) => {
-      const b = blocks4.get(id) as Y.Map<any>;
-      return b.get("prop:text")?.toString() || "";
     });
+
+    const blocks4 = await readBlocks(socket, docId);
+    const texts4 = getNoteChildIds(blocks4).map(id => getBlockText(blocks4, id));
     assert.ok(texts4.includes("Hello world"), "untouched paragraph preserved");
     assert.ok(texts4.includes("Updated world"), "patched paragraph updated");
     assert.ok(!texts4.includes("Goodbye world"), "old text removed");
@@ -534,44 +537,19 @@ describe("integration", () => {
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
-
-    // Add a heading and a paragraph
-    function addBlock(text: string, type: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, "affine:paragraph");
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      b.set("prop:type", type);
-      const yt = new Y.Text();
-      yt.insert(0, text);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-      return id;
-    }
-    const h2Id = addBlock("My Heading", "h2");
-    const paraId = addBlock("Some content", "text");
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const h2Id = addPara(blocks, noteId, nc, "My Heading", "h2");
+    const paraId = addPara(blocks, noteId, nc, "Some content");
 
     await pushDoc(socket, docId, ydoc);
 
-    // Read back and verify block IDs and types are trackable
     const blocks2 = await readBlocks(socket, docId);
-    const noteBlock = findByFlavour(blocks2, "affine:note")!;
-    const childIds: string[] = [];
-    (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+    const childIds = getNoteChildIds(blocks2);
     assert.equal(childIds.length, 2);
     assert.equal(childIds[0], h2Id);
     assert.equal(childIds[1], paraId);
-
-    const h2Block = blocks2.get(h2Id) as Y.Map<any>;
-    assert.equal(h2Block.get("prop:type"), "h2");
-    assert.equal(h2Block.get("prop:text")?.toString(), "My Heading");
-
-    const paraBlock = blocks2.get(paraId) as Y.Map<any>;
-    assert.equal(paraBlock.get("prop:type"), "text");
-    assert.equal(paraBlock.get("prop:text")?.toString(), "Some content");
+    assert.equal(getBlockText(blocks2, h2Id), "My Heading");
+    assert.equal(getBlockText(blocks2, paraId), "Some content");
   });
 
   it("delete_block removes block and descendants", async () => {
@@ -668,61 +646,30 @@ describe("integration", () => {
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
-
-    function addPara(txt: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, "affine:paragraph");
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      b.set("prop:type", "text");
-      const yt = new Y.Text(); yt.insert(0, txt);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-      return id;
-    }
-    const aId = addPara("A");
-    const bId = addPara("B");
-    const cId = addPara("C");
-    const dId = addPara("D");
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "A");
+    const bId = addPara(blocks, noteId, nc, "B");
+    const cId = addPara(blocks, noteId, nc, "C");
+    const dId = addPara(blocks, noteId, nc, "D");
 
     await pushDoc(socket, docId, ydoc);
 
-    // Delete B and D in one transaction
-    const doc2 = new Y.Doc();
-    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
-    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
-    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      for (const id of [bId, dId]) {
+        let idx = -1;
+        nc2.forEach((cid: string, i: number) => { if (cid === id) idx = i; });
+        if (idx >= 0) nc2.delete(idx, 1);
+        blocks2.delete(id);
+      }
+    });
 
-    const prevSV = Y.encodeStateVector(doc2);
-    const note2 = blocks2.get(noteId) as Y.Map<any>;
-    const nc2 = note2.get("sys:children") as Y.Array<any>;
-
-    // Remove B and D from children
-    const toDelete = [bId, dId];
-    for (const id of toDelete) {
-      let idx = -1;
-      nc2.forEach((cid: string, i: number) => { if (cid === id) idx = i; });
-      if (idx >= 0) nc2.delete(idx, 1);
-      blocks2.delete(id);
-    }
-
-    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
-
-    // Verify only A and C remain
     const blocks3 = await readBlocks(socket, docId);
     assert.ok(blocks3.get(aId), "A should exist");
     assert.equal(blocks3.get(bId), undefined, "B should be deleted");
     assert.ok(blocks3.get(cId), "C should exist");
     assert.equal(blocks3.get(dId), undefined, "D should be deleted");
-
-    const note3 = findByFlavour(blocks3, "affine:note")!;
-    const finalIds: string[] = [];
-    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => finalIds.push(id));
-    assert.deepEqual(finalIds, [aId, cId], "only A and C should remain");
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, cId]);
   });
 
   it("update_doc_markdown char offset logic", async () => {
@@ -730,91 +677,37 @@ describe("integration", () => {
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
-
-    // Add 3 paragraphs: A, B, C
-    function addPara(text: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, "affine:paragraph");
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      b.set("prop:type", "text");
-      const yt = new Y.Text(); yt.insert(0, text);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-      return id;
-    }
-    const aId = addPara("Block A");
-    const bId = addPara("Block B");
-    const cId = addPara("Block C");
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Block A");
+    const bId = addPara(blocks, noteId, nc, "Block B");
+    const cId = addPara(blocks, noteId, nc, "Block C");
 
     await pushDoc(socket, docId, ydoc);
 
-    // Simulate update_doc_markdown: change only "Block B" → "Block B Updated"
-    const doc2 = new Y.Doc();
-    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
-    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
-    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const bText = (blocks2.get(bId) as Y.Map<any>).get("prop:text") as Y.Text;
+      bText.delete(0, bText.length);
+      bText.insert(0, "Block B Updated");
+    });
 
-    // Verify only block B is affected
-    const prevSV = Y.encodeStateVector(doc2);
-    const bBlock = blocks2.get(bId) as Y.Map<any>;
-    const bText = bBlock.get("prop:text") as Y.Text;
-    bText.delete(0, bText.length);
-    bText.insert(0, "Block B Updated");
-
-    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
-
-    // Read back and verify A and C unchanged, B updated
     const blocks3 = await readBlocks(socket, docId);
-    const aBlock3 = blocks3.get(aId) as Y.Map<any>;
-    const bBlock3 = blocks3.get(bId) as Y.Map<any>;
-    const cBlock3 = blocks3.get(cId) as Y.Map<any>;
-
-    assert.equal(aBlock3.get("prop:text")?.toString(), "Block A", "A should be unchanged");
-    assert.equal(bBlock3.get("prop:text")?.toString(), "Block B Updated", "B should be updated");
-    assert.equal(cBlock3.get("prop:text")?.toString(), "Block C", "C should be unchanged");
-
-    // Verify block IDs are preserved (surgical update, not full rewrite)
-    const noteBlock3 = findByFlavour(blocks3, "affine:note")!;
-    const childIds3: string[] = [];
-    (noteBlock3.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds3.push(id));
-    assert.deepEqual(childIds3, [aId, bId, cId], "block IDs should be preserved");
+    assert.equal(getBlockText(blocks3, aId), "Block A", "A should be unchanged");
+    assert.equal(getBlockText(blocks3, bId), "Block B Updated", "B should be updated");
+    assert.equal(getBlockText(blocks3, cId), "Block C", "C should be unchanged");
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, bId, cId], "block IDs should be preserved");
   });
 
   it("update_doc_markdown works with headings and sections (blank-line consistency)", async () => {
-    // This test reproduces the bug where blocksToMarkdownWithMap collapsed
-    // consecutive blank lines, making the rendered markdown non-deterministic
-    // and causing old_markdown matching to fail.
     const { ydoc, docId, noteId } = createEmptyDoc("Blank Line Test");
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
 
-    function addBlock(flavour: string, text: string, type?: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, flavour);
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      if (type) b.set("prop:type", type);
-      const yt = new Y.Text(); yt.insert(0, text);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-      return id;
-    }
-
-    // Create a doc structure similar to the real prompt doc:
-    // heading, paragraph, heading, paragraph
-    addBlock("affine:paragraph", "Goal", "h2");
-    addBlock("affine:paragraph", "Analyze the data carefully.", "text");
-    addBlock("affine:paragraph", "Inputs", "h2");
-    addBlock("affine:paragraph", "JSON files are required.", "text");
+    addBlockTo(blocks, noteId, nc, "affine:paragraph", "Goal", "h2");
+    addBlockTo(blocks, noteId, nc, "affine:paragraph", "Analyze the data carefully.", "text");
+    addBlockTo(blocks, noteId, nc, "affine:paragraph", "Inputs", "h2");
+    addBlockTo(blocks, noteId, nc, "affine:paragraph", "JSON files are required.", "text");
 
     await pushDoc(socket, docId, ydoc);
 
@@ -859,58 +752,290 @@ describe("integration", () => {
     assert.ok(patched.includes("## Inputs"), "Unaffected sections should be preserved");
   });
 
+  it("update_doc_markdown: replace with empty string removes blocks", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Empty Replace Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Keep me");
+    const bId = addPara(blocks, noteId, nc, "Delete me");
+    const cId = addPara(blocks, noteId, nc, "Keep me too");
+
+    await pushDoc(socket, docId, ydoc);
+
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      let bIdx = -1;
+      nc2.forEach((id: string, i: number) => { if (id === bId) bIdx = i; });
+      assert.ok(bIdx >= 0, "B should be in note children");
+      nc2.delete(bIdx, 1);
+      blocks2.delete(bId);
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.equal(blocks3.get(bId), undefined, "B should be deleted");
+    assert.equal(getBlockText(blocks3, aId), "Keep me");
+    assert.equal(getBlockText(blocks3, cId), "Keep me too");
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, cId]);
+  });
+
+  it("update_doc_markdown: replace all body blocks with empty leaves empty doc", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Clear All Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const xId = addPara(blocks, noteId, nc, "First");
+    const yId = addPara(blocks, noteId, nc, "Second");
+
+    await pushDoc(socket, docId, ydoc);
+
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      while (nc2.length > 0) nc2.delete(0, 1);
+      blocks2.delete(xId);
+      blocks2.delete(yId);
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.ok(findByFlavour(blocks3, "affine:page"), "page block should survive");
+    assert.ok(findByFlavour(blocks3, "affine:surface"), "surface block should survive");
+    assert.ok(findByFlavour(blocks3, "affine:note"), "note block should survive");
+    assert.equal(blocks3.get(xId), undefined, "First should be deleted");
+    assert.equal(blocks3.get(yId), undefined, "Second should be deleted");
+    assert.equal(getNoteChildIds(blocks3).length, 0, "note should have no children");
+  });
+
+  it("update_doc_markdown: replace middle section with new content", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Mid Replace Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const h1Id = addBlockTo(blocks, noteId, nc, "affine:paragraph", "Intro", "h2");
+    const p1Id = addPara(blocks, noteId, nc, "Intro text");
+    const h2Id = addBlockTo(blocks, noteId, nc, "affine:paragraph", "Middle", "h2");
+    const p2Id = addPara(blocks, noteId, nc, "Middle text");
+    const h3Id = addBlockTo(blocks, noteId, nc, "affine:paragraph", "Outro", "h2");
+    const p3Id = addPara(blocks, noteId, nc, "Outro text");
+
+    await pushDoc(socket, docId, ydoc);
+
+    let newId1 = "", newId2 = "";
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      let h2Idx = -1, p2Idx = -1;
+      nc2.forEach((id: string, i: number) => {
+        if (id === h2Id) h2Idx = i;
+        if (id === p2Id) p2Idx = i;
+      });
+      nc2.delete(p2Idx, 1);
+      nc2.delete(h2Idx, 1);
+      blocks2.delete(h2Id);
+      blocks2.delete(p2Id);
+
+      newId1 = genId();
+      const nb1 = new Y.Map();
+      setSys(nb1, newId1, "affine:paragraph");
+      nb1.set("sys:parent", noteId);
+      nb1.set("sys:children", new Y.Array());
+      nb1.set("prop:type", "h2");
+      const nt1 = new Y.Text(); nt1.insert(0, "Replaced Section");
+      nb1.set("prop:text", nt1);
+      blocks2.set(newId1, nb1);
+
+      newId2 = genId();
+      const nb2 = new Y.Map();
+      setSys(nb2, newId2, "affine:paragraph");
+      nb2.set("sys:parent", noteId);
+      nb2.set("sys:children", new Y.Array());
+      nb2.set("prop:type", "text");
+      const nt2 = new Y.Text(); nt2.insert(0, "New replacement content");
+      nb2.set("prop:text", nt2);
+      blocks2.set(newId2, nb2);
+
+      nc2.insert(h2Idx, [newId1, newId2]);
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    const finalIds = getNoteChildIds(blocks3);
+    assert.equal(finalIds.length, 6);
+    assert.deepEqual(finalIds, [h1Id, p1Id, newId1, newId2, h3Id, p3Id]);
+    assert.equal(blocks3.get(h2Id), undefined, "old heading deleted");
+    assert.equal(blocks3.get(p2Id), undefined, "old paragraph deleted");
+    assert.equal(getBlockText(blocks3, newId1), "Replaced Section");
+    assert.equal(getBlockText(blocks3, newId2), "New replacement content");
+  });
+
+  it("update_doc_markdown: str_replace rejects when old_markdown not found", () => {
+    const md = "# Title\n\nSome content.\n";
+    assert.equal(md.indexOf("nonexistent text"), -1, "should not find missing text");
+  });
+
+  it("update_doc_markdown: str_replace rejects duplicate matches", () => {
+    const md = "# Title\n\nHello\n\nHello\n";
+    const idx = md.indexOf("Hello");
+    assert.ok(idx !== -1);
+    assert.ok(md.indexOf("Hello", idx + 1) !== -1, "should detect duplicate");
+  });
+
+  it("update_doc_markdown: replace first block preserves rest", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("First Block Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Alpha");
+    const bId = addPara(blocks, noteId, nc, "Beta");
+    const cId = addPara(blocks, noteId, nc, "Gamma");
+
+    await pushDoc(socket, docId, ydoc);
+
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const aText = (blocks2.get(aId) as Y.Map<any>).get("prop:text") as Y.Text;
+      aText.delete(0, aText.length);
+      aText.insert(0, "Alpha Updated");
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.equal(getBlockText(blocks3, aId), "Alpha Updated");
+    assert.equal(getBlockText(blocks3, bId), "Beta");
+    assert.equal(getBlockText(blocks3, cId), "Gamma");
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, bId, cId]);
+  });
+
+  it("update_doc_markdown: replace last block preserves rest", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Last Block Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "First");
+    const bId = addPara(blocks, noteId, nc, "Second");
+    const cId = addPara(blocks, noteId, nc, "Third");
+
+    await pushDoc(socket, docId, ydoc);
+
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const cText = (blocks2.get(cId) as Y.Map<any>).get("prop:text") as Y.Text;
+      cText.delete(0, cText.length);
+      cText.insert(0, "Third Updated");
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.equal(getBlockText(blocks3, aId), "First");
+    assert.equal(getBlockText(blocks3, bId), "Second");
+    assert.equal(getBlockText(blocks3, cId), "Third Updated");
+  });
+
+  it("update_doc_markdown: replace single block with multiple blocks", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Expand Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Before");
+    const bId = addPara(blocks, noteId, nc, "Replace this");
+    const cId = addPara(blocks, noteId, nc, "After");
+
+    await pushDoc(socket, docId, ydoc);
+
+    const newIds: string[] = [];
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      let bIdx = -1;
+      nc2.forEach((id: string, i: number) => { if (id === bId) bIdx = i; });
+      nc2.delete(bIdx, 1);
+      blocks2.delete(bId);
+
+      for (const txt of ["New line 1", "New line 2", "New line 3"]) {
+        const id = genId();
+        const b = new Y.Map();
+        setSys(b, id, "affine:paragraph");
+        b.set("sys:parent", noteId);
+        b.set("sys:children", new Y.Array());
+        b.set("prop:type", "text");
+        const yt = new Y.Text(); yt.insert(0, txt);
+        b.set("prop:text", yt);
+        blocks2.set(id, b);
+        newIds.push(id);
+      }
+      nc2.insert(bIdx, newIds);
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    const finalIds = getNoteChildIds(blocks3);
+    assert.equal(finalIds.length, 5);
+    assert.equal(finalIds[0], aId);
+    assert.deepEqual(finalIds.slice(1, 4), newIds);
+    assert.equal(finalIds[4], cId);
+    assert.equal(blocks3.get(bId), undefined, "old block should be gone");
+  });
+
+  it("update_doc_markdown: replace multiple blocks with single block", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Collapse Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Keep");
+    const bId = addPara(blocks, noteId, nc, "Merge 1");
+    const cId = addPara(blocks, noteId, nc, "Merge 2");
+    const dId = addPara(blocks, noteId, nc, "Merge 3");
+    const eId = addPara(blocks, noteId, nc, "Keep too");
+
+    await pushDoc(socket, docId, ydoc);
+
+    let newId = "";
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      let bIdx2 = -1;
+      nc2.forEach((id: string, i: number) => { if (id === bId) bIdx2 = i; });
+      nc2.delete(bIdx2, 3);
+      blocks2.delete(bId);
+      blocks2.delete(cId);
+      blocks2.delete(dId);
+
+      newId = genId();
+      const nb = new Y.Map();
+      setSys(nb, newId, "affine:paragraph");
+      nb.set("sys:parent", noteId);
+      nb.set("sys:children", new Y.Array());
+      nb.set("prop:type", "text");
+      const nt = new Y.Text(); nt.insert(0, "Merged content");
+      nb.set("prop:text", nt);
+      blocks2.set(newId, nb);
+      nc2.insert(bIdx2, [newId]);
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, newId, eId]);
+    assert.equal(getBlockText(blocks3, newId), "Merged content");
+  });
+
   it("move_block reorders and reparents blocks", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Move Block Test");
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
     const note = blocks.get(noteId) as Y.Map<any>;
-    const noteChildren = note.get("sys:children") as Y.Array<any>;
-
-    function addPara(txt: string) {
-      const id = genId();
-      const b = new Y.Map();
-      setSys(b, id, "affine:paragraph");
-      b.set("sys:parent", noteId);
-      b.set("sys:children", new Y.Array());
-      b.set("prop:type", "text");
-      const yt = new Y.Text(); yt.insert(0, txt);
-      b.set("prop:text", yt);
-      blocks.set(id, b);
-      noteChildren.push([id]);
-      return id;
-    }
-    const aId = addPara("A");
-    const bId = addPara("B");
-    const cId = addPara("C");
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "A");
+    const bId = addPara(blocks, noteId, nc, "B");
+    const cId = addPara(blocks, noteId, nc, "C");
 
     await pushDoc(socket, docId, ydoc);
 
-    // Move C before A (reorder within same parent)
-    const doc2 = new Y.Doc();
-    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
-    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
-    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const nc2 = (blocks2.get(noteId) as Y.Map<any>).get("sys:children") as Y.Array<any>;
+      let cIdx = -1;
+      nc2.forEach((id: string, i: number) => { if (id === cId) cIdx = i; });
+      nc2.delete(cIdx, 1);
+      nc2.insert(0, [cId]);
+    });
 
-    // Remove C from old position
-    const note2 = blocks2.get(noteId) as Y.Map<any>;
-    const nc2 = note2.get("sys:children") as Y.Array<any>;
-    let cIdx = -1;
-    nc2.forEach((id: string, i: number) => { if (id === cId) cIdx = i; });
-    nc2.delete(cIdx, 1);
-
-    // Insert C at index 0 (before A)
-    const prevSV = Y.encodeStateVector(doc2);
-    nc2.insert(0, [cId]);
-
-    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
-
-    // Verify order is now C, A, B
     const blocks3 = await readBlocks(socket, docId);
-    const note3 = findByFlavour(blocks3, "affine:note")!;
-    const finalIds: string[] = [];
-    (note3.get("sys:children") as Y.Array<any>).forEach((id: string) => finalIds.push(id));
-    assert.deepEqual(finalIds, [cId, aId, bId], "order should be C, A, B");
+    assert.deepEqual(getNoteChildIds(blocks3), [cId, aId, bId], "order should be C, A, B");
   });
 
   it("update_doc_title renames a document", async () => {
@@ -918,36 +1043,20 @@ describe("integration", () => {
     docsToCleanup.push(docId);
     await pushDoc(socket, docId, ydoc);
 
-    // Update title
-    const doc2 = new Y.Doc();
-    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
-    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
-    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
-
-    let pageId = "";
-    blocks2.forEach((_v: any, k: string) => {
-      const b = blocks2.get(k) as Y.Map<any>;
-      if (b.get("sys:flavour") === "affine:page") pageId = k;
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      let pageId = "";
+      blocks2.forEach((_v: any, k: string) => {
+        const b = blocks2.get(k) as Y.Map<any>;
+        if (b.get("sys:flavour") === "affine:page") pageId = k;
+      });
+      const pageBlock = blocks2.get(pageId) as Y.Map<any>;
+      const titleYText = pageBlock.get("prop:title") as Y.Text;
+      titleYText.delete(0, titleYText.length);
+      titleYText.insert(0, "New Title");
     });
-    assert.ok(pageId, "should have a page block");
 
-    const pageBlock = blocks2.get(pageId) as Y.Map<any>;
-    const prevSV = Y.encodeStateVector(doc2);
-    const titleYText = pageBlock.get("prop:title") as Y.Text;
-    titleYText.delete(0, titleYText.length);
-    titleYText.insert(0, "New Title");
-
-    const delta = Y.encodeStateAsUpdate(doc2, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(delta).toString("base64"));
-
-    // Verify title changed
     const blocks3 = await readBlocks(socket, docId);
-    let pageId3 = "";
-    blocks3.forEach((_v: any, k: string) => {
-      const b = blocks3.get(k) as Y.Map<any>;
-      if (b.get("sys:flavour") === "affine:page") pageId3 = k;
-    });
-    const page3 = blocks3.get(pageId3) as Y.Map<any>;
+    const page3 = findByFlavour(blocks3, "affine:page")!;
     assert.equal(page3.get("prop:title")?.toString(), "New Title");
   });
 
@@ -1576,120 +1685,140 @@ describe("Comment operations", () => {
   // ── Batch operation tests ─────────────────────────────────────────────
 
   it("batch delete_doc: delete multiple docs in one call", async () => {
-    // Create 3 docs
-    const ids: string[] = [];
-    for (let i = 0; i < 3; i++) {
-      const { ydoc, docId } = createEmptyDoc(`Batch Delete ${i}`);
-      ids.push(docId);
-      await pushDoc(socket, docId, ydoc);
-    }
-    // Register in workspace meta
-    const wsDoc = new Y.Doc();
-    const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
-    if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
-    const prevSV = Y.encodeStateVector(wsDoc);
-    const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
-    for (const docId of ids) {
-      const entry = new Y.Map();
-      entry.set("id", docId);
-      entry.set("title", "Batch Delete");
-      entry.set("createDate", Date.now());
-      entry.set("tags", new Y.Array());
-      pages.push([entry as any]);
-    }
-    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
-
-    // Now batch-delete: simulate the handler logic (remove from pages + delete docs)
-    const wsDoc2 = new Y.Doc();
-    const snap2 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
-    if (snap2.missing) Y.applyUpdate(wsDoc2, Buffer.from(snap2.missing, "base64"));
-    const prevSV2 = Y.encodeStateVector(wsDoc2);
-    const pages2 = wsDoc2.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
-    const idSet = new Set(ids);
-    const toDelete: number[] = [];
-    pages2.forEach((m: any, i: number) => {
-      if (m.get && idSet.has(m.get("id"))) toDelete.push(i);
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
     });
-    for (let i = toDelete.length - 1; i >= 0; i--) pages2.delete(toDelete[i], 1);
-    const delta2 = Y.encodeStateAsUpdate(wsDoc2, prevSV2);
-    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta2).toString("base64"));
-    for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+    await joinWorkspace(socket, WORKSPACE_ID!);
+    try {
+      // Create 3 docs
+      const ids: string[] = [];
+      for (let i = 0; i < 3; i++) {
+        const { ydoc, docId } = createEmptyDoc(`Batch Delete ${i}`);
+        ids.push(docId);
+        const update = Y.encodeStateAsUpdate(ydoc);
+        await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
+      }
+      // Register in workspace meta
+      const wsDoc = new Y.Doc();
+      const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+      const prevSV = Y.encodeStateVector(wsDoc);
+      const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      for (const docId of ids) {
+        const entry = new Y.Map();
+        entry.set("id", docId);
+        entry.set("title", "Batch Delete");
+        entry.set("createDate", Date.now());
+        entry.set("tags", new Y.Array());
+        pages.push([entry as any]);
+      }
+      const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
 
-    // Verify all removed from meta
-    const wsDoc3 = new Y.Doc();
-    const snap3 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
-    if (snap3.missing) Y.applyUpdate(wsDoc3, Buffer.from(snap3.missing, "base64"));
-    const pages3 = wsDoc3.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
-    const remaining = new Set<string>();
-    pages3.forEach((m: any) => { if (m.get) remaining.add(m.get("id")); });
-    for (const id of ids) {
-      assert.ok(!remaining.has(id), `doc ${id} should be removed from workspace meta`);
+      // Now batch-delete: simulate the handler logic (remove from pages + delete docs)
+      const wsDoc2 = new Y.Doc();
+      const snap2 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap2.missing) Y.applyUpdate(wsDoc2, Buffer.from(snap2.missing, "base64"));
+      const prevSV2 = Y.encodeStateVector(wsDoc2);
+      const pages2 = wsDoc2.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      const idSet = new Set(ids);
+      const toDelete: number[] = [];
+      pages2.forEach((m: any, i: number) => {
+        if (m.get && idSet.has(m.get("id"))) toDelete.push(i);
+      });
+      for (let i = toDelete.length - 1; i >= 0; i--) pages2.delete(toDelete[i], 1);
+      const delta2 = Y.encodeStateAsUpdate(wsDoc2, prevSV2);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta2).toString("base64"));
+      for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+
+      // Verify all removed from meta
+      const wsDoc3 = new Y.Doc();
+      const snap3 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap3.missing) Y.applyUpdate(wsDoc3, Buffer.from(snap3.missing, "base64"));
+      const pages3 = wsDoc3.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      const remaining = new Set<string>();
+      pages3.forEach((m: any) => { if (m.get) remaining.add(m.get("id")); });
+      for (const id of ids) {
+        assert.ok(!remaining.has(id), `doc ${id} should be removed from workspace meta`);
+      }
+      console.log(`  batch deleted ${ids.length} docs`);
+    } finally {
+      socket.disconnect();
     }
-    console.log(`  batch deleted ${ids.length} docs`);
   });
 
   it("batch publish_doc / revoke_doc: multiple docs", async () => {
-    // Create 2 docs
-    const ids: string[] = [];
-    for (let i = 0; i < 2; i++) {
-      const { ydoc, docId } = createEmptyDoc(`Batch Publish ${i}`);
-      ids.push(docId);
-      docsToCleanup.push(docId);
-      await pushDoc(socket, docId, ydoc);
-    }
-    // Register in workspace meta
-    const wsDoc = new Y.Doc();
-    const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
-    if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
-    const prevSV = Y.encodeStateVector(wsDoc);
-    const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
-    for (const docId of ids) {
-      const entry = new Y.Map();
-      entry.set("id", docId);
-      entry.set("title", "Batch Publish");
-      entry.set("createDate", Date.now());
-      entry.set("tags", new Y.Array());
-      pages.push([entry as any]);
-    }
-    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
-    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+    try {
+      // Create 2 docs
+      const ids: string[] = [];
+      for (let i = 0; i < 2; i++) {
+        const { ydoc, docId } = createEmptyDoc(`Batch Publish ${i}`);
+        ids.push(docId);
+        const update = Y.encodeStateAsUpdate(ydoc);
+        await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
+      }
+      // Register in workspace meta
+      const wsDoc = new Y.Doc();
+      const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+      const prevSV = Y.encodeStateVector(wsDoc);
+      const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      for (const docId of ids) {
+        const entry = new Y.Map();
+        entry.set("id", docId);
+        entry.set("title", "Batch Publish");
+        entry.set("createDate", Date.now());
+        entry.set("tags", new Y.Array());
+        pages.push([entry as any]);
+      }
+      const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
 
-    // Batch publish via GraphQL
-    const publishMutation = `mutation PublishDoc($workspaceId:String!,$docId:String!,$mode:PublicDocMode){ publishDoc(workspaceId:$workspaceId, docId:$docId, mode:$mode){ id workspaceId public mode } }`;
-    const endpoint = BASE_URL + "/graphql";
-    const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` };
+      // Batch publish via GraphQL
+      const publishMutation = `mutation PublishDoc($workspaceId:String!,$docId:String!,$mode:PublicDocMode){ publishDoc(workspaceId:$workspaceId, docId:$docId, mode:$mode){ id workspaceId public mode } }`;
+      const endpoint = BASE_URL + "/graphql";
+      const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` };
 
-    const publishResults = await Promise.all(
-      ids.map(docId =>
-        fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ query: publishMutation, variables: { workspaceId: WORKSPACE_ID, docId, mode: "Page" } }),
-        }).then(r => r.json() as any)
-      )
-    );
-    for (const r of publishResults) {
-      assert.ok(!r.errors, "publish should succeed");
-      assert.equal(r.data.publishDoc.public, true);
-    }
-    console.log(`  batch published ${ids.length} docs`);
+      const publishResults = await Promise.all(
+        ids.map(docId =>
+          fetch(endpoint, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ query: publishMutation, variables: { workspaceId: WORKSPACE_ID, docId, mode: "Page" } }),
+          }).then(r => r.json() as any)
+        )
+      );
+      for (const r of publishResults) {
+        assert.ok(!r.errors, "publish should succeed");
+        assert.equal(r.data.publishDoc.public, true);
+      }
+      console.log(`  batch published ${ids.length} docs`);
 
-    // Batch revoke
-    const revokeMutation = `mutation RevokeDoc($workspaceId:String!,$docId:String!){ revokePublicDoc(workspaceId:$workspaceId, docId:$docId){ id workspaceId public } }`;
-    const revokeResults = await Promise.all(
-      ids.map(docId =>
-        fetch(endpoint, {
-          method: "POST",
-          headers,
-          body: JSON.stringify({ query: revokeMutation, variables: { workspaceId: WORKSPACE_ID, docId } }),
-        }).then(r => r.json() as any)
-      )
-    );
-    for (const r of revokeResults) {
-      assert.ok(!r.errors, "revoke should succeed");
-      assert.equal(r.data.revokePublicDoc.public, false);
+      // Batch revoke
+      const revokeMutation = `mutation RevokeDoc($workspaceId:String!,$docId:String!){ revokePublicDoc(workspaceId:$workspaceId, docId:$docId){ id workspaceId public } }`;
+      const revokeResults = await Promise.all(
+        ids.map(docId =>
+          fetch(endpoint, {
+            method: "POST",
+            headers,
+            body: JSON.stringify({ query: revokeMutation, variables: { workspaceId: WORKSPACE_ID, docId } }),
+          }).then(r => r.json() as any)
+        )
+      );
+      for (const r of revokeResults) {
+        assert.ok(!r.errors, "revoke should succeed");
+        assert.equal(r.data.revokePublicDoc.public, false);
+      }
+      console.log(`  batch revoked ${ids.length} docs`);
+
+      // Clean up: delete the published docs
+      for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+    } finally {
+      socket.disconnect();
     }
-    console.log(`  batch revoked ${ids.length} docs`);
   });
 });
