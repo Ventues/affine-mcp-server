@@ -424,4 +424,142 @@ describe("organize: folder operations", () => {
     assert.match(id, /^db\$[a-f0-9-]+\$folders$/, "wire doc ID matches db$<uuid>$folders format");
     console.log(`  wire doc ID: ${id}`);
   });
+
+  it("11. batch add_doc_to_folder: add multiple docs in one transaction", async () => {
+    socket = await connect();
+    const ydoc = await loadFoldersDoc(socket);
+    const prevSV = Y.encodeStateVector(ydoc);
+
+    const folderId = testPrefix + "batch_add_folder";
+    testEntryIds.push(folderId);
+    insertEntry(ydoc, { id: folderId, parentId: null, type: "folder", data: "Batch Add Test", index: "z9_batch_add" });
+
+    // Batch add 3 doc links
+    const docIds = ["batch-doc-1", "batch-doc-2", "batch-doc-3"];
+    const linkIds: string[] = [];
+    for (const docId of docIds) {
+      const linkId = testPrefix + "batch_link_" + docId;
+      linkIds.push(linkId);
+      testEntryIds.push(linkId);
+      const siblings = getChildren(ydoc, folderId);
+      const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
+      // Simple index generation for test
+      const index = lastIndex ? lastIndex + "1" : "a0";
+      insertEntry(ydoc, { id: linkId, parentId: folderId, type: "doc", data: docId, index });
+    }
+
+    const children = getChildren(ydoc, folderId);
+    assert.equal(children.length, 3, "should have 3 doc links");
+    assert.deepEqual(children.map(c => c.data), docIds, "doc IDs match in order");
+
+    await pushChanges(socket, ydoc, prevSV);
+
+    // Verify persistence
+    socket.disconnect();
+    socket = await connect();
+    const ydoc2 = await loadFoldersDoc(socket);
+    const children2 = getChildren(ydoc2, folderId);
+    assert.equal(children2.length, 3, "3 doc links persist after reconnect");
+    console.log(`  batch add ${docIds.length} docs OK`);
+
+    // Cleanup
+    const prevSV2 = Y.encodeStateVector(ydoc2);
+    for (const id of linkIds) deleteEntry(ydoc2, id);
+    deleteEntry(ydoc2, folderId);
+    await pushChanges(socket, ydoc2, prevSV2);
+    socket.disconnect();
+  });
+
+  it("12. batch remove_from_folder: remove multiple nodes in one transaction", async () => {
+    socket = await connect();
+    const ydoc = await loadFoldersDoc(socket);
+    const prevSV = Y.encodeStateVector(ydoc);
+
+    // Create folder with 3 doc links
+    const folderId = testPrefix + "batch_rm_folder";
+    testEntryIds.push(folderId);
+    insertEntry(ydoc, { id: folderId, parentId: null, type: "folder", data: "Batch Remove Test", index: "z9_batch_rm" });
+
+    const linkIds: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const linkId = testPrefix + `batch_rm_link_${i}`;
+      linkIds.push(linkId);
+      testEntryIds.push(linkId);
+      insertEntry(ydoc, { id: linkId, parentId: folderId, type: "doc", data: `rm-doc-${i}`, index: `a${i}` });
+    }
+    await pushChanges(socket, ydoc, prevSV);
+
+    // Batch remove all 3 links
+    socket.disconnect();
+    socket = await connect();
+    const ydoc2 = await loadFoldersDoc(socket);
+    const prevSV2 = Y.encodeStateVector(ydoc2);
+    for (const id of linkIds) deleteEntry(ydoc2, id);
+    await pushChanges(socket, ydoc2, prevSV2);
+
+    // Verify
+    socket.disconnect();
+    socket = await connect();
+    const ydoc3 = await loadFoldersDoc(socket);
+    const children = getChildren(ydoc3, folderId);
+    assert.equal(children.length, 0, "all links removed");
+    console.log(`  batch removed ${linkIds.length} nodes OK`);
+
+    // Cleanup folder
+    const prevSV3 = Y.encodeStateVector(ydoc3);
+    deleteEntry(ydoc3, folderId);
+    await pushChanges(socket, ydoc3, prevSV3);
+    socket.disconnect();
+  });
+
+  it("13. batch move_to_folder: move multiple nodes to new parent", async () => {
+    socket = await connect();
+    const ydoc = await loadFoldersDoc(socket);
+    const prevSV = Y.encodeStateVector(ydoc);
+
+    // Create 2 folders and 2 doc links in folder A
+    const folderA = testPrefix + "batch_mv_A";
+    const folderB = testPrefix + "batch_mv_B";
+    testEntryIds.push(folderA, folderB);
+    insertEntry(ydoc, { id: folderA, parentId: null, type: "folder", data: "Folder A", index: "z9_mv_a" });
+    insertEntry(ydoc, { id: folderB, parentId: null, type: "folder", data: "Folder B", index: "z9_mv_b" });
+
+    const linkIds: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const linkId = testPrefix + `batch_mv_link_${i}`;
+      linkIds.push(linkId);
+      testEntryIds.push(linkId);
+      insertEntry(ydoc, { id: linkId, parentId: folderA, type: "doc", data: `mv-doc-${i}`, index: `a${i}` });
+    }
+    await pushChanges(socket, ydoc, prevSV);
+
+    // Batch move both links from A to B
+    socket.disconnect();
+    socket = await connect();
+    const ydoc2 = await loadFoldersDoc(socket);
+    const prevSV2 = Y.encodeStateVector(ydoc2);
+    for (const id of linkIds) {
+      const m = ydoc2.getMap(id);
+      ydoc2.transact(() => {
+        m.set("parentId", folderB);
+      });
+    }
+    await pushChanges(socket, ydoc2, prevSV2);
+
+    // Verify
+    socket.disconnect();
+    socket = await connect();
+    const ydoc3 = await loadFoldersDoc(socket);
+    assert.equal(getChildren(ydoc3, folderA).length, 0, "folder A empty");
+    assert.equal(getChildren(ydoc3, folderB).length, 2, "folder B has 2 links");
+    console.log(`  batch moved ${linkIds.length} nodes OK`);
+
+    // Cleanup
+    const prevSV3 = Y.encodeStateVector(ydoc3);
+    for (const id of linkIds) deleteEntry(ydoc3, id);
+    deleteEntry(ydoc3, folderA);
+    deleteEntry(ydoc3, folderB);
+    await pushChanges(socket, ydoc3, prevSV3);
+    socket.disconnect();
+  });
 });

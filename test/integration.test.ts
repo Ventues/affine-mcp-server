@@ -15,6 +15,7 @@ import { describe, it, before, after } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
 import MarkdownIt from "markdown-it";
+import fetch from "node-fetch";
 import {
   wsUrlFromGraphQLEndpoint,
   connectWorkspaceSocket,
@@ -1570,5 +1571,125 @@ describe("Comment operations", () => {
     assert.equal(foundComments.size, comments.length, "All batch comments should be applied");
 
     socket.disconnect();
+  });
+
+  // ── Batch operation tests ─────────────────────────────────────────────
+
+  it("batch delete_doc: delete multiple docs in one call", async () => {
+    // Create 3 docs
+    const ids: string[] = [];
+    for (let i = 0; i < 3; i++) {
+      const { ydoc, docId } = createEmptyDoc(`Batch Delete ${i}`);
+      ids.push(docId);
+      await pushDoc(socket, docId, ydoc);
+    }
+    // Register in workspace meta
+    const wsDoc = new Y.Doc();
+    const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+    if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+    const prevSV = Y.encodeStateVector(wsDoc);
+    const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+    for (const docId of ids) {
+      const entry = new Y.Map();
+      entry.set("id", docId);
+      entry.set("title", "Batch Delete");
+      entry.set("createDate", Date.now());
+      entry.set("tags", new Y.Array());
+      pages.push([entry as any]);
+    }
+    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+
+    // Now batch-delete: simulate the handler logic (remove from pages + delete docs)
+    const wsDoc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+    if (snap2.missing) Y.applyUpdate(wsDoc2, Buffer.from(snap2.missing, "base64"));
+    const prevSV2 = Y.encodeStateVector(wsDoc2);
+    const pages2 = wsDoc2.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+    const idSet = new Set(ids);
+    const toDelete: number[] = [];
+    pages2.forEach((m: any, i: number) => {
+      if (m.get && idSet.has(m.get("id"))) toDelete.push(i);
+    });
+    for (let i = toDelete.length - 1; i >= 0; i--) pages2.delete(toDelete[i], 1);
+    const delta2 = Y.encodeStateAsUpdate(wsDoc2, prevSV2);
+    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta2).toString("base64"));
+    for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+
+    // Verify all removed from meta
+    const wsDoc3 = new Y.Doc();
+    const snap3 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+    if (snap3.missing) Y.applyUpdate(wsDoc3, Buffer.from(snap3.missing, "base64"));
+    const pages3 = wsDoc3.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+    const remaining = new Set<string>();
+    pages3.forEach((m: any) => { if (m.get) remaining.add(m.get("id")); });
+    for (const id of ids) {
+      assert.ok(!remaining.has(id), `doc ${id} should be removed from workspace meta`);
+    }
+    console.log(`  batch deleted ${ids.length} docs`);
+  });
+
+  it("batch publish_doc / revoke_doc: multiple docs", async () => {
+    // Create 2 docs
+    const ids: string[] = [];
+    for (let i = 0; i < 2; i++) {
+      const { ydoc, docId } = createEmptyDoc(`Batch Publish ${i}`);
+      ids.push(docId);
+      docsToCleanup.push(docId);
+      await pushDoc(socket, docId, ydoc);
+    }
+    // Register in workspace meta
+    const wsDoc = new Y.Doc();
+    const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+    if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+    const prevSV = Y.encodeStateVector(wsDoc);
+    const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+    for (const docId of ids) {
+      const entry = new Y.Map();
+      entry.set("id", docId);
+      entry.set("title", "Batch Publish");
+      entry.set("createDate", Date.now());
+      entry.set("tags", new Y.Array());
+      pages.push([entry as any]);
+    }
+    const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+    await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+
+    // Batch publish via GraphQL
+    const publishMutation = `mutation PublishDoc($workspaceId:String!,$docId:String!,$mode:PublicDocMode){ publishDoc(workspaceId:$workspaceId, docId:$docId, mode:$mode){ id workspaceId public mode } }`;
+    const endpoint = BASE_URL + "/graphql";
+    const headers: Record<string, string> = { "Content-Type": "application/json", Authorization: `Bearer ${TOKEN}` };
+
+    const publishResults = await Promise.all(
+      ids.map(docId =>
+        fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ query: publishMutation, variables: { workspaceId: WORKSPACE_ID, docId, mode: "Page" } }),
+        }).then(r => r.json() as any)
+      )
+    );
+    for (const r of publishResults) {
+      assert.ok(!r.errors, "publish should succeed");
+      assert.equal(r.data.publishDoc.public, true);
+    }
+    console.log(`  batch published ${ids.length} docs`);
+
+    // Batch revoke
+    const revokeMutation = `mutation RevokeDoc($workspaceId:String!,$docId:String!){ revokePublicDoc(workspaceId:$workspaceId, docId:$docId){ id workspaceId public } }`;
+    const revokeResults = await Promise.all(
+      ids.map(docId =>
+        fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ query: revokeMutation, variables: { workspaceId: WORKSPACE_ID, docId } }),
+        }).then(r => r.json() as any)
+      )
+    );
+    for (const r of revokeResults) {
+      assert.ok(!r.errors, "revoke should succeed");
+      assert.equal(r.data.revokePublicDoc.public, false);
+    }
+    console.log(`  batch revoked ${ids.length} docs`);
   });
 });

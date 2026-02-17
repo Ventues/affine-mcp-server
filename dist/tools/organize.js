@@ -291,33 +291,42 @@ export function registerOrganizeTools(server, gql, defaults) {
             parentId: z.string().optional().describe("Parent folder ID. Omit for root level."),
         },
     }, createFolderHandler);
-    // ADD DOC TO FOLDER
+    // ADD DOC TO FOLDER (single or batch)
     const addDocToFolderHandler = async (parsed) => {
         const ws = resolveWs(parsed);
-        const result = await withFoldersDoc(gql, ws, (doc) => {
+        const ids = parsed.docIds ?? (parsed.docId ? [parsed.docId] : []);
+        if (ids.length === 0)
+            throw new Error("Provide docId or docIds");
+        const results = await withFoldersDoc(gql, ws, (doc) => {
             const parent = getEntry(doc, parsed.folderId);
             if (!parent || parent.type !== "folder")
                 throw new Error("Folder not found");
-            const siblings = getChildren(doc, parsed.folderId);
-            // Check for duplicate doc link
-            const existing = siblings.find((s) => s.type === "doc" && s.data === parsed.docId);
-            if (existing)
-                return { linkId: existing.id, folderId: parsed.folderId, docId: parsed.docId, index: existing.index, duplicate: true };
-            const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
-            const index = generateIndexBetween(lastIndex, null);
-            const id = generateNodeId();
-            insertEntry(doc, { id, parentId: parsed.folderId, type: "doc", data: parsed.docId, index });
-            return { linkId: id, folderId: parsed.folderId, docId: parsed.docId, index };
+            const out = [];
+            for (const docId of ids) {
+                const siblings = getChildren(doc, parsed.folderId);
+                const existing = siblings.find((s) => s.type === "doc" && s.data === docId);
+                if (existing) {
+                    out.push({ linkId: existing.id, folderId: parsed.folderId, docId, index: existing.index, duplicate: true });
+                    continue;
+                }
+                const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
+                const index = generateIndexBetween(lastIndex, null);
+                const id = generateNodeId();
+                insertEntry(doc, { id, parentId: parsed.folderId, type: "doc", data: docId, index });
+                out.push({ linkId: id, folderId: parsed.folderId, docId, index });
+            }
+            return out;
         });
-        return text(result);
+        return text(results.length === 1 ? results[0] : results);
     };
     server.registerTool("add_doc_to_folder", {
         title: "Add Doc to Folder",
-        description: "Add a document link into a folder.",
+        description: "Add a document link into a folder. Supports single docId or batch docIds array.",
         inputSchema: {
             workspaceId: z.string().optional(),
             folderId: z.string().describe("Target folder ID"),
-            docId: z.string().describe("Document ID to add"),
+            docId: z.string().optional().describe("Document ID to add"),
+            docIds: z.array(z.string()).optional().describe("Array of document IDs to add (batch mode)"),
         },
     }, addDocToFolderHandler);
     // RENAME FOLDER
@@ -342,70 +351,97 @@ export function registerOrganizeTools(server, gql, defaults) {
             name: z.string().describe("New folder name"),
         },
     }, renameFolderHandler);
-    // MOVE NODE (folder or link) to a different parent
+    // MOVE NODE (single or batch — folder or link to a different parent)
     const moveNodeHandler = async (parsed) => {
         const ws = resolveWs(parsed);
-        const result = await withFoldersDoc(gql, ws, (doc) => {
-            const node = getEntry(doc, parsed.nodeId);
-            if (!node)
-                throw new Error("Node not found");
+        const ids = parsed.nodeIds ?? (parsed.nodeId ? [parsed.nodeId] : []);
+        if (ids.length === 0)
+            throw new Error("Provide nodeId or nodeIds");
+        const results = await withFoldersDoc(gql, ws, (doc) => {
             const newParentId = parsed.parentId ?? null;
             if (newParentId) {
-                if (parsed.nodeId === newParentId)
-                    throw new Error("Cannot move a node into itself");
-                if (isAncestor(doc, newParentId, parsed.nodeId))
-                    throw new Error("Cannot move a node into its own descendant");
                 const parent = getEntry(doc, newParentId);
                 if (!parent || parent.type !== "folder")
                     throw new Error("Target parent folder not found");
             }
-            else if (node.type !== "folder") {
-                throw new Error("Only folders can be at root level");
+            const out = [];
+            for (const nodeId of ids) {
+                const node = getEntry(doc, nodeId);
+                if (!node) {
+                    out.push({ id: nodeId, error: "Node not found" });
+                    continue;
+                }
+                if (newParentId) {
+                    if (nodeId === newParentId) {
+                        out.push({ id: nodeId, error: "Cannot move a node into itself" });
+                        continue;
+                    }
+                    if (isAncestor(doc, newParentId, nodeId)) {
+                        out.push({ id: nodeId, error: "Cannot move a node into its own descendant" });
+                        continue;
+                    }
+                }
+                else if (node.type !== "folder") {
+                    out.push({ id: nodeId, error: "Only folders can be at root level" });
+                    continue;
+                }
+                const siblings = getChildren(doc, newParentId);
+                const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
+                const index = generateIndexBetween(lastIndex, null);
+                const m = doc.getMap(nodeId);
+                doc.transact(() => {
+                    m.set("parentId", newParentId);
+                    m.set("index", index);
+                });
+                out.push({ id: nodeId, parentId: newParentId, index });
             }
-            const siblings = getChildren(doc, newParentId);
-            const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
-            const index = generateIndexBetween(lastIndex, null);
-            const m = doc.getMap(parsed.nodeId);
-            doc.transact(() => {
-                m.set("parentId", newParentId);
-                m.set("index", index);
-            });
-            return { id: parsed.nodeId, parentId: newParentId, index };
+            return out;
         });
-        return text(result);
+        return text(results.length === 1 ? results[0] : results);
     };
     server.registerTool("move_to_folder", {
         title: "Move to Folder",
-        description: "Move a folder or doc link to a different parent folder (or root).",
+        description: "Move a folder or doc link to a different parent folder (or root). Supports single nodeId or batch nodeIds array.",
         inputSchema: {
             workspaceId: z.string().optional(),
-            nodeId: z.string().describe("ID of the node (folder or link) to move"),
+            nodeId: z.string().optional().describe("ID of the node (folder or link) to move"),
+            nodeIds: z.array(z.string()).optional().describe("Array of node IDs to move (batch mode)"),
             parentId: z.string().optional().describe("Target parent folder ID. Omit to move to root."),
         },
     }, moveNodeHandler);
-    // REMOVE FROM FOLDER (delete a link or folder recursively)
+    // REMOVE FROM FOLDER (single or batch — delete links or folders recursively)
     const removeFromFolderHandler = async (parsed) => {
         const ws = resolveWs(parsed);
-        const result = await withFoldersDoc(gql, ws, (doc) => {
-            const node = getEntry(doc, parsed.nodeId);
-            if (!node)
-                throw new Error("Node not found");
-            if (node.type === "folder") {
-                deleteRecursive(doc, parsed.nodeId);
+        const ids = parsed.nodeIds ?? (parsed.nodeId ? [parsed.nodeId] : []);
+        if (ids.length === 0)
+            throw new Error("Provide nodeId or nodeIds");
+        const results = await withFoldersDoc(gql, ws, (doc) => {
+            const out = [];
+            for (const nodeId of ids) {
+                const node = getEntry(doc, nodeId);
+                if (!node) {
+                    out.push({ deleted: false, id: nodeId, error: "Node not found" });
+                    continue;
+                }
+                if (node.type === "folder") {
+                    deleteRecursive(doc, nodeId);
+                }
+                else {
+                    deleteEntry(doc, nodeId);
+                }
+                out.push({ deleted: true, id: nodeId, type: node.type });
             }
-            else {
-                deleteEntry(doc, parsed.nodeId);
-            }
-            return { deleted: true, id: parsed.nodeId, type: node.type };
+            return out;
         });
-        return text(result);
+        return text(results.length === 1 ? results[0] : results);
     };
     server.registerTool("remove_from_folder", {
         title: "Remove from Folder",
-        description: "Remove a node from the folder tree. Folders are deleted recursively with all contents.",
+        description: "Remove a node from the folder tree. Supports single nodeId or batch nodeIds array. Folders are deleted recursively with all contents.",
         inputSchema: {
             workspaceId: z.string().optional(),
-            nodeId: z.string().describe("ID of the node to remove"),
+            nodeId: z.string().optional().describe("ID of the node to remove"),
+            nodeIds: z.array(z.string()).optional().describe("Array of node IDs to remove (batch mode)"),
         },
     }, removeFromFolderHandler);
 }

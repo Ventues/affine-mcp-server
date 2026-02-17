@@ -2825,23 +2825,28 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   server.registerTool("update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler as any);
   server.registerTool("affine_update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler as any);
 
-  const publishDocHandler = async (parsed: { workspaceId?: string; docId: string; mode?: "Page" | "Edgeless" }) => {
+  const publishDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[]; mode?: "Page" | "Edgeless" }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
       if (!workspaceId) {
         throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
       }
+      const ids = parsed.docIds ?? (parsed.docId ? [parsed.docId] : []);
+      if (ids.length === 0) throw new Error("Provide docId or docIds");
       const mutation = `mutation PublishDoc($workspaceId:String!,$docId:String!,$mode:PublicDocMode){ publishDoc(workspaceId:$workspaceId, docId:$docId, mode:$mode){ id workspaceId public mode } }`;
-      const data = await gql.request<{ publishDoc: any }>(mutation, { workspaceId, docId: parsed.docId, mode: parsed.mode });
-      return text(data.publishDoc);
+      const results = await Promise.all(
+        ids.map(docId => gql.request<{ publishDoc: any }>(mutation, { workspaceId, docId, mode: parsed.mode }).then(d => d.publishDoc))
+      );
+      return text(results.length === 1 ? results[0] : results);
     };
   server.registerTool(
     "publish_doc",
     {
       title: "Publish Document",
-      description: "Publish a doc (make public).",
+      description: "Publish a doc (make public). Supports single docId or batch docIds array.",
       inputSchema: {
         workspaceId: z.string().optional(),
-        docId: z.string(),
+        docId: z.string().optional(),
+        docIds: z.array(z.string()).optional().describe("Array of document IDs to publish (batch mode)"),
         mode: z.enum(["Page","Edgeless"]).optional()
       }
     },
@@ -2851,33 +2856,39 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "affine_publish_doc",
     {
       title: "Publish Document",
-      description: "Publish a doc (make public).",
+      description: "Publish a doc (make public). Supports single docId or batch docIds array.",
       inputSchema: {
         workspaceId: z.string().optional(),
-        docId: z.string(),
+        docId: z.string().optional(),
+        docIds: z.array(z.string()).optional().describe("Array of document IDs to publish (batch mode)"),
         mode: z.enum(["Page","Edgeless"]).optional()
       }
     },
     publishDocHandler as any
   );
 
-  const revokeDocHandler = async (parsed: { workspaceId?: string; docId: string }) => {
+  const revokeDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
       if (!workspaceId) {
         throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
       }
+      const ids = parsed.docIds ?? (parsed.docId ? [parsed.docId] : []);
+      if (ids.length === 0) throw new Error("Provide docId or docIds");
       const mutation = `mutation RevokeDoc($workspaceId:String!,$docId:String!){ revokePublicDoc(workspaceId:$workspaceId, docId:$docId){ id workspaceId public } }`;
-      const data = await gql.request<{ revokePublicDoc: any }>(mutation, { workspaceId, docId: parsed.docId });
-      return text(data.revokePublicDoc);
+      const results = await Promise.all(
+        ids.map(docId => gql.request<{ revokePublicDoc: any }>(mutation, { workspaceId, docId }).then(d => d.revokePublicDoc))
+      );
+      return text(results.length === 1 ? results[0] : results);
     };
   server.registerTool(
     "revoke_doc",
     {
       title: "Revoke Document",
-      description: "Revoke a doc's public access.",
+      description: "Revoke a doc's public access. Supports single docId or batch docIds array.",
       inputSchema: {
         workspaceId: z.string().optional(),
-        docId: z.string()
+        docId: z.string().optional(),
+        docIds: z.array(z.string()).optional().describe("Array of document IDs to revoke (batch mode)")
       }
     },
     revokeDocHandler as any
@@ -2886,10 +2897,11 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     "affine_revoke_doc",
     {
       title: "Revoke Document",
-      description: "Revoke a doc's public access.",
+      description: "Revoke a doc's public access. Supports single docId or batch docIds array.",
       inputSchema: {
         workspaceId: z.string().optional(),
-        docId: z.string()
+        docId: z.string().optional(),
+        docIds: z.array(z.string()).optional().describe("Array of document IDs to revoke (batch mode)")
       }
     },
     revokeDocHandler as any
@@ -3176,10 +3188,12 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     appendBlockHandler as any
   );
 
-  // DELETE DOC
-  const deleteDocHandler = async (parsed: { workspaceId?: string; docId: string }) => {
+  // DELETE DOC (single or batch)
+  const deleteDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error('workspaceId is required');
+    const ids = parsed.docIds ?? (parsed.docId ? [parsed.docId] : []);
+    if (ids.length === 0) throw new Error('Provide docId or docIds');
     const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
     const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
@@ -3192,20 +3206,21 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
       const prevSV = Y.encodeStateVector(wsDoc);
       const wsMeta = wsDoc.getMap('meta');
       const pages = wsMeta.get('pages') as Y.Array<Y.Map<any>> | undefined;
+      const idSet = new Set(ids);
       if (pages) {
-        // find by id
-        let idx = -1;
+        // delete in reverse to preserve indices
+        const toDelete: number[] = [];
         pages.forEach((m: any, i: number) => {
-          if (idx >= 0) return;
-          if (m.get && m.get('id') === parsed.docId) idx = i;
+          if (m.get && idSet.has(m.get('id'))) toDelete.push(i);
         });
-        if (idx >= 0) pages.delete(idx, 1);
+        for (let i = toDelete.length - 1; i >= 0; i--) pages.delete(toDelete[i], 1);
       }
       const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
       await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString('base64'));
-      // delete doc content
-      wsDeleteDoc(socket, workspaceId, parsed.docId);
-      return text({ deleted: true });
+      // delete doc contents
+      for (const docId of ids) wsDeleteDoc(socket, workspaceId, docId);
+      const results = ids.map(docId => ({ deleted: true, docId }));
+      return text(results.length === 1 ? results[0] : results);
     } finally {
       socket.disconnect();
     }
@@ -3214,8 +3229,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     'delete_doc',
     {
       title: 'Delete Document',
-      description: 'Delete a document and remove from workspace list',
-      inputSchema: { workspaceId: z.string().optional(), docId: z.string() },
+      description: 'Delete a document and remove from workspace list. Supports single docId or batch docIds array.',
+      inputSchema: { workspaceId: z.string().optional(), docId: z.string().optional(), docIds: z.array(z.string()).optional().describe("Array of document IDs to delete (batch mode)") },
     },
     deleteDocHandler as any
   );
@@ -3223,8 +3238,8 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     'affine_delete_doc',
     {
       title: 'Delete Document',
-      description: 'Delete a document and remove from workspace list',
-      inputSchema: { workspaceId: z.string().optional(), docId: z.string() },
+      description: 'Delete a document and remove from workspace list. Supports single docId or batch docIds array.',
+      inputSchema: { workspaceId: z.string().optional(), docId: z.string().optional(), docIds: z.array(z.string()).optional().describe("Array of document IDs to delete (batch mode)") },
     },
     deleteDocHandler as any
   );
