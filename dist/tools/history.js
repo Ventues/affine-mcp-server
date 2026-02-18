@@ -9,16 +9,6 @@ export function registerHistoryTools(server, gql, defaults) {
         const data = await gql.request(query, { workspaceId, guid: parsed.guid, take: parsed.take, before: parsed.before });
         return text(data.workspace.histories);
     };
-    server.registerTool("affine_list_histories", {
-        title: "List Histories",
-        description: "List doc histories (timestamps) for a doc.",
-        inputSchema: {
-            workspaceId: z.string().optional(),
-            guid: z.string(),
-            take: z.number().optional(),
-            before: z.string().optional()
-        }
-    }, listHistoriesHandler);
     server.registerTool("list_histories", {
         title: "List Histories",
         description: "List doc histories (timestamps) for a doc.",
@@ -37,15 +27,6 @@ export function registerHistoryTools(server, gql, defaults) {
         const data = await gql.request(mutation, { workspaceId, guid: parsed.guid, timestamp: parsed.timestamp });
         return text({ recoveredAt: data.recoverDoc });
     };
-    server.registerTool("affine_recover_doc", {
-        title: "Recover Document",
-        description: "Recover a doc to a previous timestamp.",
-        inputSchema: {
-            workspaceId: z.string().optional(),
-            guid: z.string(),
-            timestamp: z.string()
-        }
-    }, recoverDocHandler);
     server.registerTool("recover_doc", {
         title: "Recover Document",
         description: "Recover a doc to a previous timestamp.",

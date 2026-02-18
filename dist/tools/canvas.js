@@ -369,7 +369,6 @@ export function registerCanvasTools(server, gql, defaults) {
         },
     };
     server.registerTool("add_shape", addShapeMeta, addShape);
-    server.registerTool("affine_add_shape", addShapeMeta, addShape);
     const addConnectorMeta = {
         title: "Add Connector to Canvas",
         description: "Connect two elements on the canvas.",
@@ -383,7 +382,6 @@ export function registerCanvasTools(server, gql, defaults) {
         },
     };
     server.registerTool("add_connector", addConnectorMeta, addConnector);
-    server.registerTool("affine_add_connector", addConnectorMeta, addConnector);
     const addCanvasTextMeta = {
         title: "Add Text to Canvas",
         description: "Add standalone text element on canvas.",
@@ -398,7 +396,6 @@ export function registerCanvasTools(server, gql, defaults) {
         },
     };
     server.registerTool("add_canvas_text", addCanvasTextMeta, addCanvasText);
-    server.registerTool("affine_add_canvas_text", addCanvasTextMeta, addCanvasText);
     const listCanvasElementsMeta = {
         title: "List Canvas Elements",
         description: "List all elements on the Edgeless canvas with their types, positions, and IDs.",
@@ -408,7 +405,6 @@ export function registerCanvasTools(server, gql, defaults) {
         },
     };
     server.registerTool("list_canvas_elements", listCanvasElementsMeta, listCanvasElements);
-    server.registerTool("affine_list_canvas_elements", listCanvasElementsMeta, listCanvasElements);
     const buildGraphMeta = {
         title: "Build Graph",
         description: "Create a complete graph/diagram in one call with auto-layout. Nodes are shapes, edges are connectors.",
@@ -432,5 +428,4 @@ export function registerCanvasTools(server, gql, defaults) {
         },
     };
     server.registerTool("build_graph", buildGraphMeta, buildGraph);
-    server.registerTool("affine_build_graph", buildGraphMeta, buildGraph);
 }

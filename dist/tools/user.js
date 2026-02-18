@@ -5,11 +5,6 @@ export function registerUserTools(server, gql) {
         const data = await gql.request(query);
         return text(data.currentUser);
     };
-    server.registerTool("affine_current_user", {
-        title: "Current User",
-        description: "Get current signed-in user.",
-        inputSchema: {}
-    }, currentUserHandler);
     server.registerTool("current_user", {
         title: "Current User",
         description: "Get current signed-in user.",

@@ -11,16 +11,6 @@ export function registerUpdateTools(server, gql, defaults) {
         const data = await gql.request(query, { workspaceId, docId: parsed.docId, op: parsed.op, updates: parsed.updates });
         return text(data.applyDocUpdates);
     };
-    server.registerTool("affine_apply_doc_updates", {
-        title: "Apply Document Updates",
-        description: `Apply CRDT updates to a doc (advanced). ${deprecationNote}`,
-        inputSchema: {
-            workspaceId: z.string().optional(),
-            docId: z.string(),
-            op: z.string(),
-            updates: z.string()
-        }
-    }, applyDocUpdatesHandler);
     server.registerTool("apply_doc_updates", {
         title: "Apply Document Updates",
         description: `Apply CRDT updates to a doc (advanced). ${deprecationNote}`,
