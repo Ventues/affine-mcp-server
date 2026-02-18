@@ -1059,6 +1059,110 @@ describe("integration", () => {
     assert.equal(getBlockText(blocks3, newId), "Merged content");
   });
 
+  it("update_doc_markdown: code block before list does not corrupt adjacent sections", async () => {
+    // Regression test for cross-section block corruption.
+    // Root cause: blocksToMarkdownWithMap pushed multi-line code content as a single
+    // array element, causing blockLineRanges to diverge from actual markdown line numbers.
+    const { ydoc, docId, noteId } = createEmptyDoc("Code Block Corruption Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+
+    // ## Section A  (heading + code block + list)
+    addPara(blocks, noteId, nc, "Section A", "h2");
+    const codeId = genId();
+    const code = new Y.Map();
+    setSys(code, codeId, "affine:code");
+    code.set("sys:parent", noteId);
+    code.set("sys:children", new Y.Array());
+    code.set("prop:language", "txt");
+    const ct = new Y.Text();
+    ct.insert(0, "line1\nline2\nline3\nline4\nline5\nline6\nline7\nline8\nline9\nline10");
+    code.set("prop:text", ct);
+    blocks.set(codeId, code);
+    nc.push([codeId]);
+
+    addBlockTo(blocks, noteId, nc, "affine:list", "Item A1", "bulleted");
+    addBlockTo(blocks, noteId, nc, "affine:list", "Item A2", "bulleted");
+
+    // ## Section B  (heading + paragraph + list)
+    addPara(blocks, noteId, nc, "Section B", "h2");
+    addPara(blocks, noteId, nc, "Intro text.");
+    const b1Id = addBlockTo(blocks, noteId, nc, "affine:list", "Item B1", "bulleted");
+    const b2Id = addBlockTo(blocks, noteId, nc, "affine:list", "Item B2", "bulleted");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read the rendered markdown and verify both lists are present
+    const doc2 = new Y.Doc();
+    const snap2 = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap2.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    const noteBlock2 = findByFlavour(blocks2, "affine:note")!;
+
+    // Render markdown the same way the handler does
+    const lines: string[] = [];
+    const noteChildIds: string[] = [];
+    (noteBlock2.get("sys:children") as Y.Array<any>).forEach((id: string) => noteChildIds.push(id));
+    const blockLineRanges: { blockId: string; startLine: number; endLine: number }[] = [];
+    lines.push("# Code Block Corruption Test", "");
+    let prevWasList = false;
+    for (const childId of noteChildIds) {
+      const raw = blocks2.get(childId) as Y.Map<any>;
+      const flavour = raw.get("sys:flavour") as string;
+      const isList = flavour === "affine:list";
+      if (!isList && prevWasList) lines.push("");
+      const startLine = lines.length;
+      if (flavour === "affine:code") {
+        const lang = raw.get("prop:language") || "";
+        const text = raw.get("prop:text")?.toString() || "";
+        lines.push(`\`\`\`${lang}`, ...text.split("\n"), `\`\`\``, "");
+      } else if (flavour === "affine:paragraph") {
+        const type = raw.get("prop:type") as string;
+        const text = raw.get("prop:text")?.toString() || "";
+        if (type?.startsWith("h")) {
+          lines.push(`${"#".repeat(parseInt(type[1]))} ${text}`, "");
+        } else {
+          if (text) lines.push(text, "");
+        }
+      } else if (flavour === "affine:list") {
+        const text = raw.get("prop:text")?.toString() || "";
+        lines.push(`- ${text}`);
+      }
+      blockLineRanges.push({ blockId: childId, startLine, endLine: lines.length });
+      prevWasList = isList;
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const md = lines.join("\n") + "\n";
+
+    // The old_markdown targets Section A's list
+    const oldMd = "- Item A1\n- Item A2";
+    const idx = md.indexOf(oldMd);
+    assert.ok(idx !== -1, `Should find old_markdown in rendered markdown`);
+    assert.equal(md.indexOf(oldMd, idx + 1), -1, "Should match only once");
+
+    // Compute char offsets and verify the correct blocks are identified as affected
+    const mdLines = md.split("\n");
+    const lineToCharOffset = [0];
+    for (let i = 0; i < mdLines.length; i++) {
+      lineToCharOffset.push(lineToCharOffset[i] + mdLines[i].length + 1);
+    }
+    const changeStart = idx;
+    const changeEnd = idx + oldMd.length;
+    const affectedIds: string[] = [];
+    for (const r of blockLineRanges) {
+      const bStart = lineToCharOffset[r.startLine];
+      const bEnd = lineToCharOffset[r.endLine];
+      if (bEnd > changeStart && bStart < changeEnd) affectedIds.push(r.blockId);
+    }
+
+    // Critical assertion: affected blocks should be the Section A list items, NOT Section B's
+    assert.equal(affectedIds.length, 2, `Should affect exactly 2 blocks (the A list items), got ${affectedIds.length}`);
+    assert.ok(!affectedIds.includes(b1Id), "Section B list item B1 must NOT be affected");
+    assert.ok(!affectedIds.includes(b2Id), "Section B list item B2 must NOT be affected");
+  });
+
   it("move_block reorders and reparents blocks", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Move Block Test");
     docsToCleanup.push(docId);
@@ -1806,7 +1910,70 @@ describe("Comment operations", () => {
 
   // ── Batch operation tests ─────────────────────────────────────────────
 
-  it("batch delete_doc: delete multiple docs in one call", async () => {
+  it("delete_doc soft-deletes (trashes) a single doc", async () => {
+    const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
+      Authorization: `Bearer ${TOKEN}`,
+    });
+    await joinWorkspace(socket, WORKSPACE_ID!);
+    try {
+      // Create a doc and register in workspace meta
+      const { ydoc, docId } = createEmptyDoc("Trash Me");
+      const update = Y.encodeStateAsUpdate(ydoc);
+      await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
+
+      const wsDoc = new Y.Doc();
+      const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
+      let prevSV = Y.encodeStateVector(wsDoc);
+      const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      const entry = new Y.Map();
+      entry.set("id", docId);
+      entry.set("title", "Trash Me");
+      entry.set("createDate", Date.now());
+      entry.set("tags", new Y.Array());
+      pages.push([entry as any]);
+      let delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+
+      // Soft-delete: set trash flag (mirrors new handler logic)
+      const wsDoc2 = new Y.Doc();
+      const snap2 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap2.missing) Y.applyUpdate(wsDoc2, Buffer.from(snap2.missing, "base64"));
+      prevSV = Y.encodeStateVector(wsDoc2);
+      const pages2 = wsDoc2.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      pages2.forEach((m: any) => {
+        if (m.get && m.get("id") === docId) {
+          m.set("trash", true);
+          m.set("trashDate", Date.now());
+        }
+      });
+      delta = Y.encodeStateAsUpdate(wsDoc2, prevSV);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
+
+      // Verify: page still in meta but has trash=true
+      const wsDoc3 = new Y.Doc();
+      const snap3 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
+      if (snap3.missing) Y.applyUpdate(wsDoc3, Buffer.from(snap3.missing, "base64"));
+      const pages3 = wsDoc3.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
+      let found = false;
+      pages3.forEach((m: any) => {
+        if (m.get && m.get("id") === docId) {
+          assert.equal(m.get("trash"), true, "doc should be marked as trash");
+          assert.ok(m.get("trashDate"), "trashDate should be set");
+          found = true;
+        }
+      });
+      assert.ok(found, "trashed doc should still exist in workspace meta");
+      console.log(`  soft-deleted doc ${docId}`);
+
+      // Cleanup: hard-remove from meta
+      await cleanupDoc(socket, docId);
+    } finally {
+      socket.disconnect();
+    }
+  });
+
+  it("batch delete_doc soft-deletes multiple docs", async () => {
     const socket = await connectWorkspaceSocket(wsUrlFromGraphQLEndpoint(BASE_URL!), {
       Authorization: `Bearer ${TOKEN}`,
     });
@@ -1815,7 +1982,7 @@ describe("Comment operations", () => {
       // Create 3 docs
       const ids: string[] = [];
       for (let i = 0; i < 3; i++) {
-        const { ydoc, docId } = createEmptyDoc(`Batch Delete ${i}`);
+        const { ydoc, docId } = createEmptyDoc(`Batch Trash ${i}`);
         ids.push(docId);
         const update = Y.encodeStateAsUpdate(ydoc);
         await pushDocUpdate(socket, WORKSPACE_ID!, docId, Buffer.from(update).toString("base64"));
@@ -1824,46 +1991,56 @@ describe("Comment operations", () => {
       const wsDoc = new Y.Doc();
       const snap = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
       if (snap.missing) Y.applyUpdate(wsDoc, Buffer.from(snap.missing, "base64"));
-      const prevSV = Y.encodeStateVector(wsDoc);
+      let prevSV = Y.encodeStateVector(wsDoc);
       const pages = wsDoc.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
       for (const docId of ids) {
         const entry = new Y.Map();
         entry.set("id", docId);
-        entry.set("title", "Batch Delete");
+        entry.set("title", "Batch Trash");
         entry.set("createDate", Date.now());
         entry.set("tags", new Y.Array());
         pages.push([entry as any]);
       }
-      const delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
+      let delta = Y.encodeStateAsUpdate(wsDoc, prevSV);
       await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
 
-      // Now batch-delete: simulate the handler logic (remove from pages + delete docs)
+      // Soft-delete: set trash flags (mirrors new handler logic)
       const wsDoc2 = new Y.Doc();
       const snap2 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
       if (snap2.missing) Y.applyUpdate(wsDoc2, Buffer.from(snap2.missing, "base64"));
-      const prevSV2 = Y.encodeStateVector(wsDoc2);
+      prevSV = Y.encodeStateVector(wsDoc2);
       const pages2 = wsDoc2.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
       const idSet = new Set(ids);
-      const toDelete: number[] = [];
-      pages2.forEach((m: any, i: number) => {
-        if (m.get && idSet.has(m.get("id"))) toDelete.push(i);
+      const trashed: string[] = [];
+      pages2.forEach((m: any) => {
+        if (m.get && idSet.has(m.get("id"))) {
+          m.set("trash", true);
+          m.set("trashDate", Date.now());
+          trashed.push(m.get("id"));
+        }
       });
-      for (let i = toDelete.length - 1; i >= 0; i--) pages2.delete(toDelete[i], 1);
-      const delta2 = Y.encodeStateAsUpdate(wsDoc2, prevSV2);
-      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta2).toString("base64"));
-      for (const docId of ids) wsDeleteDoc(socket, WORKSPACE_ID!, docId);
+      delta = Y.encodeStateAsUpdate(wsDoc2, prevSV);
+      await pushDocUpdate(socket, WORKSPACE_ID!, WORKSPACE_ID!, Buffer.from(delta).toString("base64"));
 
-      // Verify all removed from meta
+      // Verify: all docs still in meta with trash=true
       const wsDoc3 = new Y.Doc();
       const snap3 = await loadDoc(socket, WORKSPACE_ID!, WORKSPACE_ID!);
       if (snap3.missing) Y.applyUpdate(wsDoc3, Buffer.from(snap3.missing, "base64"));
       const pages3 = wsDoc3.getMap("meta").get("pages") as Y.Array<Y.Map<any>>;
-      const remaining = new Set<string>();
-      pages3.forEach((m: any) => { if (m.get) remaining.add(m.get("id")); });
-      for (const id of ids) {
-        assert.ok(!remaining.has(id), `doc ${id} should be removed from workspace meta`);
-      }
-      console.log(`  batch deleted ${ids.length} docs`);
+      const trashedSet = new Set<string>();
+      pages3.forEach((m: any) => {
+        if (m.get && idSet.has(m.get("id"))) {
+          assert.equal(m.get("trash"), true, `doc ${m.get("id")} should be trashed`);
+          assert.ok(m.get("trashDate"), "trashDate should be set");
+          trashedSet.add(m.get("id"));
+        }
+      });
+      assert.equal(trashedSet.size, ids.length, "all docs should be trashed");
+      assert.deepEqual(trashed.sort(), ids.sort(), "trashed list should match input ids");
+      console.log(`  batch soft-deleted ${ids.length} docs`);
+
+      // Cleanup: hard-remove from meta
+      await cleanupDocs(socket, ids);
     } finally {
       socket.disconnect();
     }
