@@ -16,6 +16,7 @@ import { registerNotificationTools } from "./tools/notifications.js";
 import { loginWithPassword } from "./auth.js";
 import { registerAuthTools } from "./tools/auth.js";
 import { registerOrganizeTools } from "./tools/organize.js";
+import { registerCanvasTools } from "./tools/canvas.js";
 
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
@@ -79,6 +80,7 @@ async function buildServer() {
   registerNotificationTools(server, gql);
   registerAuthTools(server, gql, config.baseUrl);
   registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+  registerCanvasTools(server, gql, { workspaceId: config.defaultWorkspaceId });
   return server;
 }
 
