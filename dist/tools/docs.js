@@ -3157,4 +3157,112 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
         description: 'Delete a document and remove from workspace list. Supports single docId or batch docIds array.',
         inputSchema: { workspaceId: z.string().optional(), docId: z.string().optional(), docIds: z.array(z.string()).optional().describe("Array of document IDs to delete (batch mode)") },
     }, deleteDocHandler);
+    // ── search_doc_blocks ──────────────────────────────────────────────────
+    // Searches the rendered markdown (same as read_doc_as_markdown output),
+    // then maps character offsets back to blocks via blockLineRanges.
+    // Naturally handles matches spanning multiple blocks.
+    const searchDocBlocksHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId)
+            throw new Error("workspaceId is required.");
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+        try {
+            await joinWorkspace(socket, workspaceId);
+            const doc = new Y.Doc();
+            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+            if (!snapshot.missing)
+                return text({ docId: parsed.docId, exists: false, matches: [] });
+            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+            const yBlocks = doc.getMap("blocks");
+            const noteId = findBlockIdByFlavour(yBlocks, "affine:note");
+            if (!noteId)
+                return text({ docId: parsed.docId, exists: true, query: parsed.query, matches: [] });
+            const noteBlock = yBlocks.get(noteId);
+            const pageId = findBlockIdByFlavour(yBlocks, "affine:page");
+            let title = "";
+            if (pageId) {
+                const pageBlock = yBlocks.get(pageId);
+                if (pageBlock)
+                    title = asText(pageBlock.get("prop:title"));
+            }
+            const { markdown, blockLineRanges } = blocksToMarkdownWithMap(yBlocks, noteBlock, title);
+            // Build line→char offset table
+            const mdLines = markdown.split("\n");
+            const lineCharOffset = [0];
+            for (let i = 0; i < mdLines.length; i++) {
+                lineCharOffset.push(lineCharOffset[i] + mdLines[i].length + 1);
+            }
+            // Find all occurrences of query in the markdown
+            const ci = !parsed.caseSensitive;
+            const haystack = ci ? markdown.toLowerCase() : markdown;
+            const needle = ci ? parsed.query.toLowerCase() : parsed.query;
+            const matches = [];
+            let searchFrom = 0;
+            while (searchFrom < haystack.length) {
+                const idx = haystack.indexOf(needle, searchFrom);
+                if (idx === -1)
+                    break;
+                searchFrom = idx + 1;
+                const matchEnd = idx + needle.length;
+                // Find which line the match starts/ends on
+                let startLine = 0;
+                for (let l = 1; l < lineCharOffset.length; l++) {
+                    if (lineCharOffset[l] > idx) {
+                        startLine = l - 1;
+                        break;
+                    }
+                }
+                let endLine = startLine;
+                for (let l = startLine + 1; l < lineCharOffset.length; l++) {
+                    if (lineCharOffset[l] >= matchEnd) {
+                        endLine = l - 1;
+                        break;
+                    }
+                }
+                // Map lines to blocks
+                const hitBlocks = [];
+                const seen = new Set();
+                for (const range of blockLineRanges) {
+                    if (range.endLine <= startLine)
+                        continue;
+                    if (range.startLine > endLine)
+                        break;
+                    if (seen.has(range.blockId))
+                        continue;
+                    seen.add(range.blockId);
+                    const block = yBlocks.get(range.blockId);
+                    const blockCharLen = lineCharOffset[range.endLine] - lineCharOffset[range.startLine];
+                    hitBlocks.push({
+                        blockId: range.blockId,
+                        flavour: block?.get("sys:flavour") || null,
+                        type: block?.get("prop:type") || null,
+                        length: blockCharLen,
+                    });
+                }
+                // Extract a short context snippet around the match
+                const ctxStart = Math.max(0, idx - 40);
+                const ctxEnd = Math.min(markdown.length, matchEnd + 40);
+                const context = (ctxStart > 0 ? "..." : "") + markdown.slice(ctxStart, ctxEnd) + (ctxEnd < markdown.length ? "..." : "");
+                matches.push({ offset: idx, length: needle.length, context, blocks: hitBlocks });
+            }
+            return text({ docId: parsed.docId, exists: true, query: parsed.query, totalMatches: matches.length, matches });
+        }
+        finally {
+            socket.disconnect();
+        }
+    };
+    const searchDocBlocksMeta = {
+        title: "Search Document Blocks",
+        description: "Search a document's rendered markdown for a query string. Returns all occurrences with their character offset, a context snippet, and the block IDs (with flavour, type, and character length) that each match spans. Searches the same markdown output as read_doc_as_markdown, so matches are directly usable with update_doc_markdown. Handles matches within a single block and across multiple consecutive blocks.",
+        inputSchema: {
+            workspaceId: WorkspaceId.optional(),
+            docId: DocId,
+            query: z.string().min(1).describe("Text to search for in the rendered markdown"),
+            caseSensitive: z.boolean().optional().describe("Case-sensitive search (default: false)"),
+        },
+    };
+    server.registerTool("search_doc_blocks", searchDocBlocksMeta, searchDocBlocksHandler);
+    server.registerTool("affine_search_doc_blocks", searchDocBlocksMeta, searchDocBlocksHandler);
 }

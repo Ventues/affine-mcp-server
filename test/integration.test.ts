@@ -1689,6 +1689,63 @@ describe("integration", () => {
     const escapedCell = cellText.replace(/\|/g, "\\|");
     assert.equal(escapedCell, "Avg \\|Change\\|", "exported markdown should escape pipes");
   });
+
+  it("search_doc_blocks finds single-block and cross-block matches", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Search Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+
+    addBlockTo(blocks, noteId, nc, "affine:paragraph", "Introduction", "h2");
+    addPara(blocks, noteId, nc, "The quick brown fox jumps over the lazy dog.");
+    addPara(blocks, noteId, nc, "Another paragraph with unique-marker-xyz inside.");
+    addPara(blocks, noteId, nc, "This block ends with a partial");
+    addPara(blocks, noteId, nc, "sentence that continues here.");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Read rendered markdown (same as search_doc_blocks uses internally)
+    const doc2 = new Y.Doc();
+    const snap = await loadDoc(socket, WORKSPACE_ID!, docId);
+    Y.applyUpdate(doc2, Buffer.from(snap.missing!, "base64"));
+    const blocks2 = doc2.getMap("blocks") as Y.Map<any>;
+    const noteBlock = findByFlavour(blocks2, "affine:note")!;
+
+    // Inline minimal markdown render to verify search targets
+    const childIds: string[] = [];
+    (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+    const lines: string[] = ["# Search Test", ""];
+    for (const cid of childIds) {
+      const b = blocks2.get(cid) as Y.Map<any>;
+      const type = b.get("prop:type") as string;
+      const txt = b.get("prop:text")?.toString() || "";
+      if (type?.startsWith("h")) {
+        lines.push(`${"#".repeat(parseInt(type[1], 10))} ${txt}`, "");
+      } else {
+        lines.push(txt, "");
+      }
+    }
+    while (lines.length > 0 && lines[lines.length - 1] === "") lines.pop();
+    const md = lines.join("\n") + "\n";
+
+    // 1) Single-block match: "unique-marker-xyz" exists in one block
+    const singleIdx = md.indexOf("unique-marker-xyz");
+    assert.ok(singleIdx !== -1, "unique-marker-xyz should be in rendered markdown");
+    assert.equal(md.indexOf("unique-marker-xyz", singleIdx + 1), -1, "should appear only once");
+
+    // 2) Cross-block match: "partial\nsentence" spans two blocks
+    const crossQuery = "partial\n\nsentence";
+    const crossIdx = md.indexOf(crossQuery);
+    assert.ok(crossIdx !== -1, `Cross-block query should be findable in rendered markdown. Got:\n${md}`);
+
+    // 3) Case-insensitive: "QUICK BROWN" should match "quick brown"
+    const ciIdx = md.toLowerCase().indexOf("quick brown");
+    assert.ok(ciIdx !== -1, "case-insensitive search should find 'quick brown'");
+
+    // 4) No match: nonsense string should not be found
+    assert.equal(md.indexOf("zzz-no-match-zzz"), -1, "nonsense query should not match");
+  });
 });
 
 

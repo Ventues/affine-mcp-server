@@ -1224,20 +1224,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     listDocsHandler as any
   );
-  server.registerTool(
-    "affine_list_docs",
-    {
-      title: "List Documents",
-      description: "List documents in a workspace (GraphQL).",
-      inputSchema: {
-        workspaceId: z.string().describe("Workspace ID (optional if default set).").optional(),
-        first: z.number().optional(),
-        offset: z.number().optional(),
-        after: z.string().optional()
-      }
-    },
-    listDocsHandler as any
-  );
 
   const getDocHandler = async (parsed: { workspaceId?: string; docId: string }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -1250,18 +1236,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     };
   server.registerTool(
     "get_doc",
-    {
-      title: "Get Document",
-      description: "Get a document by ID (GraphQL metadata).",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        docId: DocId
-      }
-    },
-    getDocHandler as any
-  );
-  server.registerTool(
-    "affine_get_doc",
     {
       title: "Get Document",
       description: "Get a document by ID (GraphQL metadata).",
@@ -1343,19 +1317,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     },
     searchDocsHandler as any
   );
-  server.registerTool(
-    "affine_search_docs",
-    {
-      title: "Search Documents",
-      description: "Search documents in a workspace.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        keyword: z.string().min(1),
-        limit: z.number().optional()
-      }
-    },
-    searchDocsHandler as any
-  );
 
   // RECENT DOCS
   const recentDocsHandler = async (parsed: { workspaceId?: string; first?: number; offset?: number; after?: string }) => {
@@ -1386,20 +1347,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     };
   server.registerTool(
     "recent_docs",
-    {
-      title: "Recent Documents",
-      description: "List recently updated docs in a workspace.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        first: z.number().optional(),
-        offset: z.number().optional(),
-        after: z.string().optional()
-      }
-    },
-    recentDocsHandler as any
-  );
-  server.registerTool(
-    "affine_recent_docs",
     {
       title: "Recent Documents",
       description: "List recently updated docs in a workspace.",
@@ -1521,18 +1468,6 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
   };
   server.registerTool(
     "read_doc",
-    {
-      title: "Read Document Content",
-      description: "Read document block content via WebSocket snapshot (blocks + plain text).",
-      inputSchema: {
-        workspaceId: WorkspaceId.optional(),
-        docId: DocId,
-      },
-    },
-    readDocHandler as any
-  );
-  server.registerTool(
-    "affine_read_doc_content",
     {
       title: "Read Document Content",
       description: "Read document block content via WebSocket snapshot (blocks + plain text).",
@@ -2384,7 +2319,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("update_block", updateBlockMeta, updateBlockHandler as any);
-  server.registerTool("affine_update_block", updateBlockMeta, updateBlockHandler as any);
 
   // ── update_blocks (bulk update) ───────────────────────────────────────
   type UpdateBlockEntry = { blockId: string; text?: string; properties?: Record<string, any> };
@@ -2465,7 +2399,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("update_blocks", updateBlocksMeta, updateBlocksHandler as any);
-  server.registerTool("affine_update_blocks", updateBlocksMeta, updateBlocksHandler as any);
 
   // ── delete_block (remove block + descendants) ─────────────────────────
   const deleteBlockHandler = async (parsed: {
@@ -2526,7 +2459,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler as any);
-  server.registerTool("affine_delete_block", deleteBlockMeta, deleteBlockHandler as any);
 
   // ── delete_blocks (bulk delete) ───────────────────────────────────────
   const deleteBlocksHandler = async (parsed: {
@@ -2592,7 +2524,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("delete_blocks", deleteBlocksMeta, deleteBlocksHandler as any);
-  server.registerTool("affine_delete_blocks", deleteBlocksMeta, deleteBlocksHandler as any);
 
   // ── delete_blocks_csv (bulk delete with CSV input) ───────────────────
   const deleteBlocksCsvHandler = async (parsed: {
@@ -2612,7 +2543,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler as any);
-  server.registerTool("affine_delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler as any);
 
   // ── move_block (reorder / reparent a block) ───────────────────────────
   const moveBlockHandler = async (parsed: {
@@ -2709,7 +2639,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("move_block", moveBlockMeta, moveBlockHandler as any);
-  server.registerTool("affine_move_block", moveBlockMeta, moveBlockHandler as any);
 
   // ── update_doc_title ──────────────────────────────────────────────────
   const updateDocTitleHandler = async (parsed: {
@@ -2785,7 +2714,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("update_doc_title", updateDocTitleMeta, updateDocTitleHandler as any);
-  server.registerTool("affine_update_doc_title", updateDocTitleMeta, updateDocTitleHandler as any);
 
   const updateDocMarkdownHandler = async (parsed: {
     workspaceId?: string; docId: string;
@@ -2933,7 +2861,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler as any);
-  server.registerTool("affine_update_doc_markdown", updateDocMarkdownMeta, updateDocMarkdownHandler as any);
 
   const publishDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[]; mode?: "Page" | "Edgeless" }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -2962,20 +2889,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
     publishDocHandler as any
   );
-  server.registerTool(
-    "affine_publish_doc",
-    {
-      title: "Publish Document",
-      description: "Publish a doc (make public). Supports single docId or batch docIds array.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        docId: z.string().optional(),
-        docIds: z.array(z.string()).optional().describe("Array of document IDs to publish (batch mode)"),
-        mode: z.enum(["Page","Edgeless"]).optional()
-      }
-    },
-    publishDocHandler as any
-  );
 
   const revokeDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
       const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -2992,19 +2905,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     };
   server.registerTool(
     "revoke_doc",
-    {
-      title: "Revoke Document",
-      description: "Revoke a doc's public access. Supports single docId or batch docIds array.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        docId: z.string().optional(),
-        docIds: z.array(z.string()).optional().describe("Array of document IDs to revoke (batch mode)")
-      }
-    },
-    revokeDocHandler as any
-  );
-  server.registerTool(
-    "affine_revoke_doc",
     {
       title: "Revoke Document",
       description: "Revoke a doc's public access. Supports single docId or batch docIds array.",
@@ -3128,19 +3028,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
     createDocHandler as any
   );
-  server.registerTool(
-    'affine_create_doc',
-    {
-      title: 'Create Document',
-      description: 'Create a new AFFiNE document with optional content',
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        title: z.string().optional(),
-        content: z.string().optional(),
-      },
-    },
-    createDocHandler as any
-  );
 
   // APPEND PARAGRAPH
   const appendParagraphHandler = async (parsed: { workspaceId?: string; docId: string; text: string }) => {
@@ -3154,19 +3041,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
   };
   server.registerTool(
     'append_paragraph',
-    {
-      title: 'Append Paragraph',
-      description: 'Append a text paragraph block to a document',
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        docId: z.string(),
-        text: z.string(),
-      },
-    },
-    appendParagraphHandler as any
-  );
-  server.registerTool(
-    'affine_append_paragraph',
     {
       title: 'Append Paragraph',
       description: 'Append a text paragraph block to a document',
@@ -3265,34 +3139,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
           })
           .optional()
           .describe("Optional insertion target/position"),
-      },
-    },
-    appendBlockHandler as any
-  );
-  server.registerTool(
-    "affine_append_block",
-    {
-      title: "Append Block",
-      description: "Append document blocks with canonical types and legacy aliases (supports placement + strict validation).",
-      inputSchema: {
-        workspaceId: WorkspaceId.optional(),
-        docId: DocId,
-        type: z.string().min(1).describe("Block type."),
-        text: z.string().optional(), url: z.string().optional(), pageId: z.string().optional(),
-        iframeUrl: z.string().optional(), html: z.string().optional(), design: z.string().optional(),
-        reference: z.string().optional(), refFlavour: z.string().optional(),
-        width: z.number().int().min(1).max(10000).optional(), height: z.number().int().min(1).max(10000).optional(),
-        background: z.string().optional(), sourceId: z.string().optional(), name: z.string().optional(),
-        mimeType: z.string().optional(), size: z.number().optional(), embed: z.boolean().optional(),
-        rows: z.number().int().min(1).max(20).optional(), columns: z.number().int().min(1).max(20).optional(),
-        latex: z.string().optional(), level: z.number().int().min(1).max(6).optional(),
-        style: AppendBlockListStyle.optional(), bookmarkStyle: AppendBlockBookmarkStyle.optional(),
-        checked: z.boolean().optional(), language: z.string().optional(), caption: z.string().optional(),
-        strict: z.boolean().optional(),
-        placement: z.object({
-          parentId: z.string().optional(), afterBlockId: z.string().optional(),
-          beforeBlockId: z.string().optional(), index: z.number().int().min(0).optional(),
-        }).optional(),
       },
     },
     appendBlockHandler as any
@@ -3401,7 +3247,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
   };
   server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler as any);
-  server.registerTool("affine_append_blocks", appendBlocksMeta, appendBlocksHandler as any);
 
   // DELETE DOC (single or batch) — moves to trash (soft delete)
   const deleteDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
@@ -3448,13 +3293,120 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     },
     deleteDocHandler as any
   );
-  server.registerTool(
-    'affine_delete_doc',
-    {
-      title: 'Delete Document',
-      description: 'Delete a document and remove from workspace list. Supports single docId or batch docIds array.',
-      inputSchema: { workspaceId: z.string().optional(), docId: z.string().optional(), docIds: z.array(z.string()).optional().describe("Array of document IDs to delete (batch mode)") },
+
+  // ── search_doc_blocks ──────────────────────────────────────────────────
+  // Searches the rendered markdown (same as read_doc_as_markdown output),
+  // then maps character offsets back to blocks via blockLineRanges.
+  // Naturally handles matches spanning multiple blocks.
+
+  const searchDocBlocksHandler = async (parsed: {
+    workspaceId?: string; docId: string; query: string; caseSensitive?: boolean;
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (!snapshot.missing) return text({ docId: parsed.docId, exists: false, matches: [] });
+      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+
+      const yBlocks = doc.getMap("blocks") as Y.Map<any>;
+      const noteId = findBlockIdByFlavour(yBlocks, "affine:note");
+      if (!noteId) return text({ docId: parsed.docId, exists: true, query: parsed.query, matches: [] });
+      const noteBlock = yBlocks.get(noteId) as Y.Map<any>;
+      const pageId = findBlockIdByFlavour(yBlocks, "affine:page");
+      let title = "";
+      if (pageId) {
+        const pageBlock = yBlocks.get(pageId) as Y.Map<any>;
+        if (pageBlock) title = asText(pageBlock.get("prop:title"));
+      }
+
+      const { markdown, blockLineRanges } = blocksToMarkdownWithMap(yBlocks, noteBlock, title);
+
+      // Build line→char offset table
+      const mdLines = markdown.split("\n");
+      const lineCharOffset: number[] = [0];
+      for (let i = 0; i < mdLines.length; i++) {
+        lineCharOffset.push(lineCharOffset[i] + mdLines[i].length + 1);
+      }
+
+      // Find all occurrences of query in the markdown
+      const ci = !parsed.caseSensitive;
+      const haystack = ci ? markdown.toLowerCase() : markdown;
+      const needle = ci ? parsed.query.toLowerCase() : parsed.query;
+
+      type MatchResult = {
+        offset: number;
+        length: number;
+        context: string;
+        blocks: { blockId: string; flavour: string | null; type: string | null; length: number }[];
+      };
+      const matches: MatchResult[] = [];
+      let searchFrom = 0;
+
+      while (searchFrom < haystack.length) {
+        const idx = haystack.indexOf(needle, searchFrom);
+        if (idx === -1) break;
+        searchFrom = idx + 1;
+
+        const matchEnd = idx + needle.length;
+
+        // Find which line the match starts/ends on
+        let startLine = 0;
+        for (let l = 1; l < lineCharOffset.length; l++) {
+          if (lineCharOffset[l] > idx) { startLine = l - 1; break; }
+        }
+        let endLine = startLine;
+        for (let l = startLine + 1; l < lineCharOffset.length; l++) {
+          if (lineCharOffset[l] >= matchEnd) { endLine = l - 1; break; }
+        }
+
+        // Map lines to blocks
+        const hitBlocks: { blockId: string; flavour: string | null; type: string | null; length: number }[] = [];
+        const seen = new Set<string>();
+        for (const range of blockLineRanges) {
+          if (range.endLine <= startLine) continue;
+          if (range.startLine > endLine) break;
+          if (seen.has(range.blockId)) continue;
+          seen.add(range.blockId);
+          const block = yBlocks.get(range.blockId) as Y.Map<any>;
+          const blockCharLen = lineCharOffset[range.endLine] - lineCharOffset[range.startLine];
+          hitBlocks.push({
+            blockId: range.blockId,
+            flavour: block?.get("sys:flavour") || null,
+            type: block?.get("prop:type") || null,
+            length: blockCharLen,
+          });
+        }
+
+        // Extract a short context snippet around the match
+        const ctxStart = Math.max(0, idx - 40);
+        const ctxEnd = Math.min(markdown.length, matchEnd + 40);
+        const context = (ctxStart > 0 ? "..." : "") + markdown.slice(ctxStart, ctxEnd) + (ctxEnd < markdown.length ? "..." : "");
+
+        matches.push({ offset: idx, length: needle.length, context, blocks: hitBlocks });
+      }
+
+      return text({ docId: parsed.docId, exists: true, query: parsed.query, totalMatches: matches.length, matches });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const searchDocBlocksMeta = {
+    title: "Search Document Blocks",
+    description: "Search a document's rendered markdown for a query string. Returns all occurrences with their character offset, a context snippet, and the block IDs (with flavour, type, and character length) that each match spans. Searches the same markdown output as read_doc_as_markdown, so matches are directly usable with update_doc_markdown. Handles matches within a single block and across multiple consecutive blocks.",
+    inputSchema: {
+      workspaceId: WorkspaceId.optional(),
+      docId: DocId,
+      query: z.string().min(1).describe("Text to search for in the rendered markdown"),
+      caseSensitive: z.boolean().optional().describe("Case-sensitive search (default: false)"),
     },
-    deleteDocHandler as any
-  );
+  };
+  server.registerTool("search_doc_blocks", searchDocBlocksMeta, searchDocBlocksHandler as any);
 }
