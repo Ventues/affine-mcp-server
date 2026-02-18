@@ -2228,6 +2228,81 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     };
     server.registerTool("update_block", updateBlockMeta, updateBlockHandler);
     server.registerTool("affine_update_block", updateBlockMeta, updateBlockHandler);
+    const updateBlocksHandler = async (parsed) => {
+        const workspaceId = parsed.workspaceId || defaults.workspaceId;
+        if (!workspaceId)
+            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+        if (!parsed.blocks || parsed.blocks.length === 0)
+            throw new Error("blocks array is required and must not be empty");
+        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+        try {
+            await joinWorkspace(socket, workspaceId);
+            const doc = new Y.Doc();
+            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+            if (!snapshot.missing)
+                throw new Error(`Document '${parsed.docId}' not found.`);
+            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+            const blocks = doc.getMap("blocks");
+            const prevSV = Y.encodeStateVector(doc);
+            const updated = [];
+            const skipped = [];
+            for (const entry of parsed.blocks) {
+                const block = findBlockById(blocks, entry.blockId);
+                if (!block) {
+                    skipped.push({ blockId: entry.blockId, reason: "not found" });
+                    continue;
+                }
+                const flavour = block.get("sys:flavour");
+                if (STRUCTURAL_FLAVOURS.has(flavour)) {
+                    skipped.push({ blockId: entry.blockId, reason: `structural (${flavour})` });
+                    continue;
+                }
+                if (entry.text !== undefined) {
+                    const yText = block.get("prop:text");
+                    if (yText instanceof Y.Text) {
+                        yText.delete(0, yText.length);
+                        yText.insert(0, entry.text);
+                    }
+                    else {
+                        block.set("prop:text", makeText(entry.text));
+                    }
+                }
+                if (entry.properties) {
+                    for (const [key, value] of Object.entries(entry.properties)) {
+                        const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
+                        block.set(propKey, value);
+                    }
+                }
+                updated.push({ blockId: entry.blockId, flavour });
+            }
+            const delta = Y.encodeStateAsUpdate(doc, prevSV);
+            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+                .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+            await touchDocMeta(socket, workspaceId, parsed.docId);
+            return text({ updated: updated.length, blocks: updated, skipped: skipped.length > 0 ? skipped : undefined });
+        }
+        finally {
+            socket.disconnect();
+        }
+    };
+    const updateBlockEntrySchema = z.object({
+        blockId: z.string().min(1).describe("ID of the block to update"),
+        text: z.string().optional().describe("New plain text content for the block"),
+        properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
+    });
+    const updateBlocksMeta = {
+        title: "Update Multiple Blocks",
+        description: "Update multiple blocks in a single transaction. Much faster than calling update_block multiple times. Skips structural blocks (page, surface, note) and missing blocks.",
+        inputSchema: {
+            workspaceId: WorkspaceId.optional(),
+            docId: DocId,
+            blocks: z.array(updateBlockEntrySchema).min(1).describe("Array of block updates. Each entry requires blockId and optionally text and/or properties."),
+        },
+    };
+    server.registerTool("update_blocks", updateBlocksMeta, updateBlocksHandler);
+    server.registerTool("affine_update_blocks", updateBlocksMeta, updateBlocksHandler);
     // ── delete_block (remove block + descendants) ─────────────────────────
     const deleteBlockHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;

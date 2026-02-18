@@ -717,6 +717,39 @@ describe("integration", () => {
     assert.deepEqual(getNoteChildIds(blocks3), [aId, cId]);
   });
 
+  it("update_blocks updates multiple blocks in one transaction", async () => {
+    const { ydoc, docId, noteId } = createEmptyDoc("Bulk Update Test");
+    docsToCleanup.push(docId);
+    const blocks = ydoc.getMap("blocks");
+    const note = blocks.get(noteId) as Y.Map<any>;
+    const nc = note.get("sys:children") as Y.Array<any>;
+    const aId = addPara(blocks, noteId, nc, "Original A");
+    const bId = addPara(blocks, noteId, nc, "Original B");
+    const cId = addPara(blocks, noteId, nc, "Original C");
+
+    await pushDoc(socket, docId, ydoc);
+
+    // Update A (text only), B (text + property), skip C
+    await mutateDoc(socket, docId, (_doc, blocks2) => {
+      const aText = (blocks2.get(aId) as Y.Map<any>).get("prop:text") as Y.Text;
+      aText.delete(0, aText.length);
+      aText.insert(0, "Updated A");
+
+      const bBlock = blocks2.get(bId) as Y.Map<any>;
+      const bText = bBlock.get("prop:text") as Y.Text;
+      bText.delete(0, bText.length);
+      bText.insert(0, "Updated B");
+      bBlock.set("prop:type", "h2");
+    });
+
+    const blocks3 = await readBlocks(socket, docId);
+    assert.equal(getBlockText(blocks3, aId), "Updated A");
+    assert.equal(getBlockText(blocks3, bId), "Updated B");
+    assert.equal((blocks3.get(bId) as Y.Map<any>).get("prop:type"), "h2");
+    assert.equal(getBlockText(blocks3, cId), "Original C", "C should be unchanged");
+    assert.deepEqual(getNoteChildIds(blocks3), [aId, bId, cId], "block order preserved");
+  });
+
   it("update_doc_markdown char offset logic", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Offset Test");
     docsToCleanup.push(docId);
