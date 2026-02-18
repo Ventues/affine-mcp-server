@@ -391,7 +391,6 @@ export function registerCanvasTools(server: McpServer, gql: GraphQLClient, defau
     },
   };
   server.registerTool("add_shape", addShapeMeta, addShape as any);
-  server.registerTool("affine_add_shape", addShapeMeta, addShape as any);
 
   const addConnectorMeta = {
     title: "Add Connector to Canvas",
@@ -406,7 +405,6 @@ export function registerCanvasTools(server: McpServer, gql: GraphQLClient, defau
     },
   };
   server.registerTool("add_connector", addConnectorMeta, addConnector as any);
-  server.registerTool("affine_add_connector", addConnectorMeta, addConnector as any);
 
   const addCanvasTextMeta = {
     title: "Add Text to Canvas",
@@ -422,7 +420,6 @@ export function registerCanvasTools(server: McpServer, gql: GraphQLClient, defau
     },
   };
   server.registerTool("add_canvas_text", addCanvasTextMeta, addCanvasText as any);
-  server.registerTool("affine_add_canvas_text", addCanvasTextMeta, addCanvasText as any);
 
   const listCanvasElementsMeta = {
     title: "List Canvas Elements",
@@ -433,7 +430,6 @@ export function registerCanvasTools(server: McpServer, gql: GraphQLClient, defau
     },
   };
   server.registerTool("list_canvas_elements", listCanvasElementsMeta, listCanvasElements as any);
-  server.registerTool("affine_list_canvas_elements", listCanvasElementsMeta, listCanvasElements as any);
 
   const buildGraphMeta = {
     title: "Build Graph",
@@ -458,5 +454,4 @@ export function registerCanvasTools(server: McpServer, gql: GraphQLClient, defau
     },
   };
   server.registerTool("build_graph", buildGraphMeta, buildGraph as any);
-  server.registerTool("affine_build_graph", buildGraphMeta, buildGraph as any);
 }

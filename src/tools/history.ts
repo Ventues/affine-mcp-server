@@ -12,20 +12,6 @@ export function registerHistoryTools(server: McpServer, gql: GraphQLClient, defa
     return text(data.workspace.histories);
   };
   server.registerTool(
-    "affine_list_histories",
-    {
-      title: "List Histories",
-      description: "List doc histories (timestamps) for a doc.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        guid: z.string(),
-        take: z.number().optional(),
-        before: z.string().optional()
-      }
-    },
-    listHistoriesHandler as any
-  );
-  server.registerTool(
     "list_histories",
     {
       title: "List Histories",
@@ -47,19 +33,6 @@ export function registerHistoryTools(server: McpServer, gql: GraphQLClient, defa
     const data = await gql.request<{ recoverDoc: string }>(mutation, { workspaceId, guid: parsed.guid, timestamp: parsed.timestamp });
     return text({ recoveredAt: data.recoverDoc });
   };
-  server.registerTool(
-    "affine_recover_doc",
-    {
-      title: "Recover Document",
-      description: "Recover a doc to a previous timestamp.",
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        guid: z.string(),
-        timestamp: z.string()
-      }
-    },
-    recoverDocHandler as any
-  );
   server.registerTool(
     "recover_doc",
     {
