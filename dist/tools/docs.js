@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { text } from "../util/mcp.js";
-import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate, deleteDoc as wsDeleteDoc } from "../ws.js";
+import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate } from "../ws.js";
 import * as Y from "yjs";
 import MarkdownIt from "markdown-it";
 const WorkspaceId = z.string().min(1, "workspaceId required");
@@ -2000,7 +2000,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
                 }
                 case "affine:code": {
                     const lang = raw.get("prop:language") || "";
-                    lines.push(`${indent}\`\`\`${lang}`, blockText, `${indent}\`\`\``, "");
+                    lines.push(`${indent}\`\`\`${lang}`, ...blockText.split("\n"), `${indent}\`\`\``, "");
                     break;
                 }
                 case "affine:divider": {
@@ -3032,7 +3032,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     };
     server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler);
     server.registerTool("affine_append_blocks", appendBlocksMeta, appendBlocksHandler);
-    // DELETE DOC (single or batch)
+    // DELETE DOC (single or batch) — moves to trash (soft delete)
     const deleteDocHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
@@ -3045,7 +3045,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
         const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         try {
             await joinWorkspace(socket, workspaceId);
-            // remove from workspace pages
             const wsDoc = new Y.Doc();
             const snapshot = await loadDoc(socket, workspaceId, workspaceId);
             if (snapshot.missing)
@@ -3054,22 +3053,19 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             const wsMeta = wsDoc.getMap('meta');
             const pages = wsMeta.get('pages');
             const idSet = new Set(ids);
+            const trashed = [];
             if (pages) {
-                // delete in reverse to preserve indices
-                const toDelete = [];
-                pages.forEach((m, i) => {
-                    if (m.get && idSet.has(m.get('id')))
-                        toDelete.push(i);
+                pages.forEach((m) => {
+                    if (m.get && idSet.has(m.get('id'))) {
+                        m.set('trash', true);
+                        m.set('trashDate', Date.now());
+                        trashed.push(m.get('id'));
+                    }
                 });
-                for (let i = toDelete.length - 1; i >= 0; i--)
-                    pages.delete(toDelete[i], 1);
             }
             const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
             await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString('base64'));
-            // delete doc contents
-            for (const docId of ids)
-                wsDeleteDoc(socket, workspaceId, docId);
-            const results = ids.map(docId => ({ deleted: true, docId }));
+            const results = ids.map(docId => ({ trashed: trashed.includes(docId), docId }));
             return text(results.length === 1 ? results[0] : results);
         }
         finally {

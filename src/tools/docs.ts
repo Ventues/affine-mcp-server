@@ -2174,7 +2174,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
         }
         case "affine:code": {
           const lang = raw.get("prop:language") || "";
-          lines.push(`${indent}\`\`\`${lang}`, blockText, `${indent}\`\`\``, "");
+          lines.push(`${indent}\`\`\`${lang}`, ...blockText.split("\n"), `${indent}\`\`\``, "");
           break;
         }
         case "affine:divider": { lines.push("---", ""); break; }
@@ -3322,7 +3322,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
   server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler as any);
   server.registerTool("affine_append_blocks", appendBlocksMeta, appendBlocksHandler as any);
 
-  // DELETE DOC (single or batch)
+  // DELETE DOC (single or batch) — moves to trash (soft delete)
   const deleteDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error('workspaceId is required');
@@ -3333,7 +3333,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
-      // remove from workspace pages
       const wsDoc = new Y.Doc();
       const snapshot = await loadDoc(socket, workspaceId, workspaceId);
       if (snapshot.missing) Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, 'base64'));
@@ -3341,19 +3340,19 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       const wsMeta = wsDoc.getMap('meta');
       const pages = wsMeta.get('pages') as Y.Array<Y.Map<any>> | undefined;
       const idSet = new Set(ids);
+      const trashed: string[] = [];
       if (pages) {
-        // delete in reverse to preserve indices
-        const toDelete: number[] = [];
-        pages.forEach((m: any, i: number) => {
-          if (m.get && idSet.has(m.get('id'))) toDelete.push(i);
+        pages.forEach((m: any) => {
+          if (m.get && idSet.has(m.get('id'))) {
+            m.set('trash', true);
+            m.set('trashDate', Date.now());
+            trashed.push(m.get('id'));
+          }
         });
-        for (let i = toDelete.length - 1; i >= 0; i--) pages.delete(toDelete[i], 1);
       }
       const wsDelta = Y.encodeStateAsUpdate(wsDoc, prevSV);
       await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(wsDelta).toString('base64'));
-      // delete doc contents
-      for (const docId of ids) wsDeleteDoc(socket, workspaceId, docId);
-      const results = ids.map(docId => ({ deleted: true, docId }));
+      const results = ids.map(docId => ({ trashed: trashed.includes(docId), docId }));
       return text(results.length === 1 ? results[0] : results);
     } finally {
       socket.disconnect();
