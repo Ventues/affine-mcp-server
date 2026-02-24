@@ -165,7 +165,8 @@ export function registerKanbanTools(server: McpServer, gql: GraphQLClient, defau
         if (!label) continue;
         const option = col.data?.options?.find((o: any) => o.value === label);
         if (!option) continue; // gracefully skip unknown labels
-        cells.set(`${cardId}:${col.id}`, { columnId: col.id, value: option.id });
+        if (!cells.has(cardId)) cells.set(cardId, new Y.Map());
+        (cells.get(cardId) as Y.Map<any>).set(col.id, new Y.Map([['columnId', col.id], ['value', option.id]]));
       }
 
       return text(JSON.stringify({ cardBlockId: cardId }));
@@ -191,7 +192,8 @@ export function registerKanbanTools(server: McpServer, gql: GraphQLClient, defau
       if (!option) throw new Error(`Status "${newStatus}" not found in options: ${statusCol.data.options.map((o: any) => o.value).join(", ")}`);
 
       const cells = dbBlock.get("prop:cells") as Y.Map<any>;
-      cells.set(`${cardBlockId}:${statusCol.id}`, { columnId: statusCol.id, value: option.id });
+      if (!cells.has(cardBlockId)) cells.set(cardBlockId, new Y.Map());
+      (cells.get(cardBlockId) as Y.Map<any>).set(statusCol.id, new Y.Map([['columnId', statusCol.id], ['value', option.id]]));
 
       return text(JSON.stringify({ ok: true }));
     });
@@ -234,9 +236,19 @@ export function registerKanbanTools(server: McpServer, gql: GraphQLClient, defau
         const cells = dbBlock.get("prop:cells") as Y.Map<any>;
         for (let j = 0; j < columns.length; j++) {
           const col = columns.get(j);
-          const cell = cells.get(`${cardId}:${col.id}`);
-          if (cell?.value && optionLabelMap[col.id]?.[cell.value]) {
-            cellValues[col.name] = optionLabelMap[col.id][cell.value];
+          // Try nested structure first: cells[cardId][colId]
+          const rowMap = cells.get(cardId);
+          let cellValue: string | undefined;
+          if (rowMap instanceof Y.Map) {
+            const cellMap = rowMap.get(col.id);
+            cellValue = cellMap instanceof Y.Map ? cellMap.get("value") : cellMap?.value;
+          } else {
+            // Fallback: flat composite key for backwards compat
+            const flat = cells.get(`${cardId}:${col.id}`);
+            cellValue = flat?.value;
+          }
+          if (cellValue && optionLabelMap[col.id]?.[cellValue]) {
+            cellValues[col.name] = optionLabelMap[col.id][cellValue];
           }
         }
 

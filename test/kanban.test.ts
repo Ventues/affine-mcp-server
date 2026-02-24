@@ -270,17 +270,22 @@ describe("Kanban tools", () => {
     assert.equal(cardBlock.get("sys:flavour"), "affine:paragraph");
     assert.ok(cardBlock.get("prop:text")?.toString().includes("Fix auth bug"));
 
-    // Verify cells
+    // Verify cells use nested Y.Map structure: cells[rowId][columnId] = { columnId, value }
     const dbBlock = blocks.get(boardData.databaseBlockId) as Y.Map<any>;
     const cells = dbBlock.get("prop:cells") as Y.Map<any>;
     const columns = dbBlock.get("prop:columns") as Y.Array<any>;
     const statusCol = columns.get(0);
-    const statusCellKey = `${cardData.cardBlockId}:${statusCol.id}`;
-    const statusCell = cells.get(statusCellKey);
-    assert.ok(statusCell, "Status cell should exist");
-    // value should be the option ID for "Todo"
+
+    // Row-level map must exist and be a Y.Map
+    const rowMap = cells.get(cardData.cardBlockId);
+    assert.ok(rowMap instanceof Y.Map, "cells[cardId] should be a Y.Map");
+
+    // Cell-level map must exist and be a Y.Map
+    const cellMap = rowMap.get(statusCol.id);
+    assert.ok(cellMap instanceof Y.Map, "cells[cardId][colId] should be a Y.Map");
+    assert.equal(cellMap.get("columnId"), statusCol.id);
     const todoOption = statusCol.data.options.find((o: any) => o.value === "Todo");
-    assert.equal(statusCell.value, todoOption.id);
+    assert.equal(cellMap.get("value"), todoOption.id);
   });
 
   it("move_kanban_card changes the status cell value", async () => {
@@ -316,16 +321,19 @@ describe("Kanban tools", () => {
     const moveData = JSON.parse(moveResult.content[0].text);
     assert.equal(moveData.ok, true);
 
-    // Verify
+    // Verify nested Y.Map structure
     const blocks = await readBlocks(socket, docId);
     const dbBlock = blocks.get(boardData.databaseBlockId) as Y.Map<any>;
     const cells = dbBlock.get("prop:cells") as Y.Map<any>;
     const columns = dbBlock.get("prop:columns") as Y.Array<any>;
     const statusCol = columns.get(0);
-    const cellKey = `${cardData.cardBlockId}:${statusCol.id}`;
-    const cell = cells.get(cellKey);
+
+    const rowMap = cells.get(cardData.cardBlockId);
+    assert.ok(rowMap instanceof Y.Map, "cells[cardId] should be a Y.Map");
+    const cellMap = rowMap.get(statusCol.id);
+    assert.ok(cellMap instanceof Y.Map, "cells[cardId][colId] should be a Y.Map");
     const inProgressOption = statusCol.data.options.find((o: any) => o.value === "In Progress");
-    assert.equal(cell.value, inProgressOption.id);
+    assert.equal(cellMap.get("value"), inProgressOption.id);
   });
 
   it("read_kanban_board returns structured board data", async () => {
