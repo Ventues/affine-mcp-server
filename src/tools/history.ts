@@ -2,6 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { GraphQLClient } from "../graphqlClient.js";
 import { text } from "../util/mcp.js";
 import { z } from "zod";
+import * as Y from "yjs";
+import { fetch } from "undici";
+import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDoc, pushDocUpdate } from "../ws.js";
 
 export function registerHistoryTools(server: McpServer, gql: GraphQLClient, defaults: { workspaceId?: string }) {
   const listHistoriesHandler = async (parsed: { workspaceId?: string; guid: string; take?: number; before?: string }) => {
@@ -26,12 +29,125 @@ export function registerHistoryTools(server: McpServer, gql: GraphQLClient, defa
     listHistoriesHandler as any
   );
 
+  /** Deeply clone a Y.Map's props (excluding sys: fields) into a target Y.Map */
+  function cloneProps(src: Y.Map<any>, dst: Y.Map<any>) {
+    for (const [key, val] of src.entries()) {
+      if (key.startsWith("sys:")) continue;
+      if (val instanceof Y.Text) {
+        const yt = new Y.Text();
+        yt.applyDelta(val.toDelta());
+        dst.set(key, yt);
+      } else if (val instanceof Y.Array) {
+        const ya = new Y.Array();
+        ya.push(val.toArray());
+        dst.set(key, ya);
+      } else {
+        dst.set(key, val);
+      }
+    }
+  }
+
   const recoverDocHandler = async (parsed: { workspaceId?: string; guid: string; timestamp: string }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId || parsed.workspaceId;
     if (!workspaceId) throw new Error("workspaceId required (or set AFFINE_WORKSPACE_ID)");
+
+    // 1. Call GraphQL mutation (creates server-side history record)
     const mutation = `mutation Recover($workspaceId:String!,$guid:String!,$timestamp:DateTime!){ recoverDoc(workspaceId:$workspaceId, guid:$guid, timestamp:$timestamp) }`;
-    const data = await gql.request<{ recoverDoc: string }>(mutation, { workspaceId, guid: parsed.guid, timestamp: parsed.timestamp });
-    return text({ recoveredAt: data.recoverDoc });
+    await gql.request<{ recoverDoc: string }>(mutation, { workspaceId, guid: parsed.guid, timestamp: parsed.timestamp });
+
+    // 2. Fetch historical snapshot via REST API
+    const baseUrl = gql.endpoint.replace(/\/graphql\/?$/, "");
+    const historyUrl = `${baseUrl}/api/workspaces/${workspaceId}/docs/${parsed.guid}/histories/${encodeURIComponent(parsed.timestamp)}`;
+    const authHeaders = gql.getAuthHeaders();
+    const histRes = await fetch(historyUrl, { headers: authHeaders });
+    if (!histRes.ok) throw new Error(`Failed to fetch history snapshot: ${histRes.status} ${histRes.statusText}`);
+    const histBuf = Buffer.from(await histRes.arrayBuffer());
+
+    // 3. Load current doc via WebSocket
+    const wsUrl = wsUrlFromGraphQLEndpoint(gql.endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const snapshot = await loadDoc(socket, workspaceId, parsed.guid);
+      if (!snapshot.missing) throw new Error(`Document '${parsed.guid}' not found.`);
+
+      // 4. Build historical doc to read target state
+      const histDoc = new Y.Doc();
+      Y.applyUpdate(histDoc, histBuf);
+      const histBlocks = histDoc.getMap("blocks") as Y.Map<any>;
+
+      // 5. Modify current doc to match historical state
+      const currentDoc = new Y.Doc();
+      Y.applyUpdate(currentDoc, Buffer.from(snapshot.missing, "base64"));
+      const prevSV = Y.encodeStateVector(currentDoc);
+      const blocks = currentDoc.getMap("blocks") as Y.Map<any>;
+
+      // Collect block IDs from both states
+      const currentIds = new Set<string>();
+      blocks.forEach((_: any, key: string) => currentIds.add(key));
+      const histIds = new Set<string>();
+      histBlocks.forEach((_: any, key: string) => histIds.add(key));
+
+      // Delete blocks that exist in current but not in historical
+      for (const id of currentIds) {
+        if (!histIds.has(id)) blocks.delete(id);
+      }
+
+      // Add/update blocks from historical state
+      for (const id of histIds) {
+        const histBlock = histBlocks.get(id) as Y.Map<any>;
+        if (!histBlock) continue;
+
+        if (!currentIds.has(id)) {
+          // New block from history — create it
+          const newBlock = new Y.Map<any>();
+          newBlock.set("sys:id", histBlock.get("sys:id"));
+          newBlock.set("sys:flavour", histBlock.get("sys:flavour"));
+          newBlock.set("sys:version", histBlock.get("sys:version"));
+          newBlock.set("sys:parent", histBlock.get("sys:parent"));
+          const histChildren = histBlock.get("sys:children");
+          if (histChildren instanceof Y.Array) {
+            const ch = new Y.Array<string>();
+            ch.push(histChildren.toArray());
+            newBlock.set("sys:children", ch);
+          } else {
+            newBlock.set("sys:children", new Y.Array<string>());
+          }
+          cloneProps(histBlock, newBlock);
+          blocks.set(id, newBlock);
+        } else {
+          // Existing block — update props to match historical state
+          const curBlock = blocks.get(id) as Y.Map<any>;
+          if (!(curBlock instanceof Y.Map)) continue;
+
+          // Update sys:children to match historical order
+          const histChildren = histBlock.get("sys:children");
+          const curChildren = curBlock.get("sys:children");
+          if (histChildren instanceof Y.Array && curChildren instanceof Y.Array) {
+            if (curChildren.length > 0) curChildren.delete(0, curChildren.length);
+            curChildren.push(histChildren.toArray());
+          }
+
+          // Update props: remove current props not in history, set historical props
+          const histKeys = new Set<string>();
+          for (const [key] of histBlock.entries()) {
+            if (!key.startsWith("sys:")) histKeys.add(key);
+          }
+          for (const [key] of curBlock.entries()) {
+            if (!key.startsWith("sys:") && !histKeys.has(key)) curBlock.delete(key);
+          }
+          cloneProps(histBlock, curBlock);
+        }
+      }
+
+      // 6. Push the diff
+      const delta = Y.encodeStateAsUpdate(currentDoc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.guid, Buffer.from(delta).toString("base64"));
+
+      return text({ recovered: true, docId: parsed.guid, timestamp: parsed.timestamp });
+    } finally {
+      socket.disconnect();
+    }
   };
   server.registerTool(
     "recover_doc",
