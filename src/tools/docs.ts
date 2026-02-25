@@ -1143,6 +1143,42 @@ export function registerDocTools(server: McpServer, gql: GraphQLClient, defaults
     blocks.delete(blockId);
   }
 
+  /** Collect attachment metadata from blocks about to be removed, keyed by name */
+  function collectAttachmentMeta(blocks: Y.Map<any>, blockIds: string[]): Map<string, { sourceId: string; size: number; type: string; embed: boolean }> {
+    const meta = new Map<string, { sourceId: string; size: number; type: string; embed: boolean }>();
+    for (const id of blockIds) {
+      const b = blocks.get(id);
+      if (!(b instanceof Y.Map)) continue;
+      if (b.get("sys:flavour") !== "affine:attachment") continue;
+      const name = b.get("prop:name");
+      if (name) meta.set(name, {
+        sourceId: b.get("prop:sourceId") || "",
+        size: b.get("prop:size") || 0,
+        type: b.get("prop:type") || "application/octet-stream",
+        embed: b.get("prop:embed") || false,
+      });
+    }
+    return meta;
+  }
+
+  /** Restore attachment metadata on newly created blocks that match by name */
+  function restoreAttachmentMeta(blocks: Y.Map<any>, newBlockIds: string[], meta: Map<string, { sourceId: string; size: number; type: string; embed: boolean }>): void {
+    if (meta.size === 0) return;
+    for (const id of newBlockIds) {
+      const b = blocks.get(id);
+      if (!(b instanceof Y.Map)) continue;
+      if (b.get("sys:flavour") !== "affine:attachment") continue;
+      const name = b.get("prop:name");
+      const existing = name ? meta.get(name) : undefined;
+      if (existing) {
+        b.set("prop:sourceId", existing.sourceId);
+        b.set("prop:size", existing.size);
+        b.set("prop:type", existing.type);
+        b.set("prop:embed", existing.embed);
+      }
+    }
+  }
+
   async function appendBlockInternal(parsed: AppendBlockInput) {
     const normalized = normalizeAppendBlockInput(parsed);
     const workspaceId = normalized.workspaceId || defaults.workspaceId;
@@ -1998,6 +2034,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
 
       // Remove the targeted blocks
       const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
+      const attachMeta = collectAttachmentMeta(blocks, idsToRemove.length > 0 ? idsToRemove : existingChildIds);
       if (idsToRemove.length > 0) {
         noteChildren.delete(replaceStart, idsToRemove.length);
         for (const cid of idsToRemove) removeBlockTree(blocks, cid);
@@ -2030,6 +2067,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       // Insert new blocks at the replace position
       const newIds = tempChildren.toArray();
       doc.getMap("__temp").delete(tempKey);
+      restoreAttachmentMeta(blocks, newIds, attachMeta);
       if (newIds.length > 0) noteChildren.insert(replaceStart, newIds);
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
@@ -2810,6 +2848,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       }
 
       // Remove affected blocks from noteChildren and blocks map
+      const attachMeta = collectAttachmentMeta(blocks, affectedBlockIds);
       for (const bid of affectedBlockIds) {
         const childIdx = indexOfChild(noteChildren, bid);
         if (childIdx >= 0) noteChildren.delete(childIdx, 1);
@@ -2828,6 +2867,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       // Insert new blocks into real note at insertIdx
       const newBlockIds: string[] = childIdsFrom(tempChildren);
       blocks.delete(tempNoteId); // clean up temp block
+      restoreAttachmentMeta(blocks, newBlockIds, attachMeta);
       for (let i = 0; i < newBlockIds.length; i++) {
         const bid = newBlockIds[i];
         const block = blocks.get(bid);
