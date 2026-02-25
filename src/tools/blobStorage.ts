@@ -89,6 +89,28 @@ export function registerBlobTools(server: McpServer, gql: GraphQLClient) {
     uploadBlobHandler as any
   );
 
+  // READ BLOB
+  const readBlobHandler = async ({ workspaceId, key }: { workspaceId: string; key: string }) => {
+    const baseUrl = gql.endpoint.replace(/\/graphql$/, '');
+    const url = `${baseUrl}/api/workspaces/${workspaceId}/blobs/${key}`;
+    const res = await fetch(url, { headers: gql.getAuthHeaders() as any });
+    if (!res.ok) throw new Error(`Blob fetch failed: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    return text({ key, contentType: res.headers.get('content-type') || 'application/octet-stream', content: buf.toString('base64') });
+  };
+  server.registerTool(
+    "read_blob",
+    {
+      title: "Read Blob",
+      description: "Read a blob/file from workspace storage. Returns base64 content.",
+      inputSchema: {
+        workspaceId: z.string().describe("Workspace ID"),
+        key: z.string().describe("Blob key/sourceId"),
+      }
+    },
+    readBlobHandler as any
+  );
+
   // DELETE BLOB
   const deleteBlobHandler = async ({ workspaceId, key, permanently = false }: { workspaceId: string; key: string; permanently?: boolean }) => {
     try {
@@ -152,4 +174,15 @@ export function registerBlobTools(server: McpServer, gql: GraphQLClient) {
     },
     cleanupBlobsHandler as any
   );
+}
+
+export function createReadBlobHandler(gql: GraphQLClient, fetchFn: typeof fetch = fetch) {
+  return async ({ workspaceId, key }: { workspaceId: string; key: string }) => {
+    const baseUrl = gql.endpoint.replace(/\/graphql$/, "");
+    const url = `${baseUrl}/api/workspaces/${workspaceId}/blobs/${key}`;
+    const res = await fetchFn(url, { headers: gql.getAuthHeaders() as any });
+    if (!res.ok) throw new Error(`Blob fetch failed: ${res.status}`);
+    const buf = Buffer.from(await res.arrayBuffer());
+    return text({ key, contentType: res.headers.get("content-type") || "application/octet-stream", content: buf.toString("base64") });
+  };
 }
