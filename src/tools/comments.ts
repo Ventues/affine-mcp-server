@@ -460,19 +460,30 @@ export function registerCommentTools(server: McpServer, gql: GraphQLClient, defa
     deleteCommentHandler as any
   );
 
-  const resolveCommentHandler = async (parsed: { id: string; resolved: boolean }) => {
+  const resolveCommentHandler = async (parsed: { id: string; resolved: boolean; workspaceId?: string; docId?: string; blockId?: string }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
     const mutation = `mutation ResolveComment($input: CommentResolveInput!){ resolveComment(input:$input) }`;
-    const data = await gql.request<{ resolveComment: boolean }>(mutation, { input: parsed });
+    const data = await gql.request<{ resolveComment: boolean }>(mutation, { input: { id: parsed.id, resolved: parsed.resolved } });
+    if (parsed.resolved && workspaceId && parsed.docId) {
+      try {
+        await removeCommentFormatting(gql, workspaceId, parsed.docId, parsed.id, parsed.blockId);
+      } catch (error) {
+        console.error("Failed to remove comment formatting:", error);
+      }
+    }
     return text({ success: data.resolveComment });
   };
   server.registerTool(
     "resolve_comment",
     {
       title: "Resolve Comment",
-      description: "Resolve or unresolve a comment.",
+      description: "Resolve or unresolve a comment. Optionally provide workspaceId, docId, and blockId to remove text highlighting when resolving.",
       inputSchema: {
         id: z.string(),
-        resolved: z.boolean()
+        resolved: z.boolean(),
+        workspaceId: z.string().optional(),
+        docId: z.string().optional(),
+        blockId: z.string().optional().describe("Block ID where the comment is anchored (speeds up formatting removal)")
       }
     },
     resolveCommentHandler as any
