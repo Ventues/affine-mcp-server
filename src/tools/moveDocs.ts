@@ -4,7 +4,8 @@ import { GraphQLClient } from "../graphqlClient.js";
 import { text } from "../util/mcp.js";
 import fetch from "node-fetch";
 import * as Y from "yjs";
-import { connectWorkspaceSocket, wsUrlFromGraphQLEndpoint, joinWorkspace, loadDoc } from "../ws.js";
+import { connectWorkspaceSocket, wsUrlFromGraphQLEndpoint, joinWorkspace, loadDoc, pushDocUpdate } from "../ws.js";
+import { applyMarkdownToNote } from "../util/blocks.js";
 
 interface BlobResult { key: string; contentType: string; content: string }
 interface BlockInfo { id: string; flavour: string; sourceId?: string }
@@ -150,45 +151,15 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
             Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
             const blocks = doc.getMap("blocks") as Y.Map<any>;
             // Extract title from page block
-            blocks.forEach((block: any, id: string) => {
+            blocks.forEach((block: any) => {
               if (!(block instanceof Y.Map)) return;
               if (block.get("sys:flavour") === "affine:page") {
                 const t = block.get("prop:title");
                 title = t instanceof Y.Text ? t.toJSON() : (t || "");
               }
             });
-            // Build simple markdown from blocks
-            const lines: string[] = [];
-            blocks.forEach((block: any, id: string) => {
-              if (!(block instanceof Y.Map)) return;
-              const flavour = block.get("sys:flavour");
-              const textProp = block.get("prop:text");
-              const txt = textProp instanceof Y.Text ? textProp.toJSON() : "";
-              if (flavour === "affine:paragraph") {
-                const type = block.get("prop:type") || "text";
-                if (type.startsWith("h")) {
-                  const level = parseInt(type.slice(1)) || 1;
-                  lines.push("#".repeat(level) + " " + txt);
-                } else {
-                  lines.push(txt);
-                }
-              } else if (flavour === "affine:list") {
-                lines.push("- " + txt);
-              } else if (flavour === "affine:code") {
-                const lang = block.get("prop:language") || "";
-                lines.push("```" + lang + "\n" + txt + "\n```");
-              } else if (flavour === "affine:image" || flavour === "affine:attachment") {
-                const sid = block.get("prop:sourceId") || "";
-                const remapped = sourceIdMap.get(sid) || sid;
-                if (flavour === "affine:image") {
-                  lines.push(`![image](${remapped})`);
-                } else {
-                  const name = block.get("prop:name") || "file";
-                  lines.push(`📎 [${name}](${remapped})`);
-                }
-              }
-            });
-            markdown = lines.join("\n\n");
+            // Build markdown by traversing sys:children in order from the note block
+            markdown = extractMarkdownOrdered(blocks, sourceIdMap);
           }
         } finally {
           socket.disconnect();
@@ -216,23 +187,9 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
               const noteId = findBlockByFlavour(blocks, "affine:note");
               if (noteId) {
                 const noteBlock = blocks.get(noteId) as Y.Map<any>;
-                const children = noteBlock.get("sys:children") as Y.Array<string>;
-                // Add a paragraph with the markdown content
-                const blockId = `move-${Date.now()}`;
-                const newBlock = new Y.Map();
-                doc.transact(() => {
-                  newBlock.set("sys:id", blockId);
-                  newBlock.set("sys:flavour", "affine:paragraph");
-                  newBlock.set("sys:children", new Y.Array());
-                  newBlock.set("prop:type", "text");
-                  const ytext = new Y.Text();
-                  ytext.insert(0, markdown);
-                  newBlock.set("prop:text", ytext);
-                  blocks.set(blockId, newBlock);
-                  children.push([blockId]);
-                });
+                const noteChildren = noteBlock.get("sys:children") as Y.Array<string>;
+                applyMarkdownToNote(markdown, noteId, blocks, noteChildren);
                 const update = Y.encodeStateAsUpdate(doc);
-                const { pushDocUpdate } = await import("../ws.js");
                 await pushDocUpdate(socket2, targetWorkspaceId, newDocId, Buffer.from(update).toString("base64"));
               }
             }
@@ -291,4 +248,51 @@ function findBlockByFlavour(blocks: Y.Map<any>, flavour: string): string | null 
     if (block instanceof Y.Map && block.get("sys:flavour") === flavour) return id;
   }
   return null;
+}
+
+/** Walk sys:children in order from the note block and produce markdown. */
+export function extractMarkdownOrdered(blocks: Y.Map<any>, sourceIdMap: Map<string, string>, indent = 0): string {
+  const noteId = findBlockByFlavour(blocks, "affine:note");
+  if (!noteId) return "";
+  return blockChildrenToMarkdown(noteId, blocks, sourceIdMap, indent);
+}
+
+function blockChildrenToMarkdown(parentId: string, blocks: Y.Map<any>, sourceIdMap: Map<string, string>, indent: number): string {
+  const parent = blocks.get(parentId) as Y.Map<any> | undefined;
+  if (!parent) return "";
+  const children = parent.get("sys:children") as Y.Array<string> | undefined;
+  if (!children || children.length === 0) return "";
+  const lines: string[] = [];
+  for (const childId of children.toArray()) {
+    const block = blocks.get(childId) as Y.Map<any> | undefined;
+    if (!block || !(block instanceof Y.Map)) continue;
+    const flavour = block.get("sys:flavour") as string;
+    const textProp = block.get("prop:text");
+    const txt = textProp instanceof Y.Text ? textProp.toJSON() : "";
+    const prefix = "  ".repeat(indent);
+    if (flavour === "affine:paragraph") {
+      const type = block.get("prop:type") || "text";
+      if (type.startsWith("h")) {
+        lines.push("#".repeat(parseInt(type.slice(1)) || 1) + " " + txt);
+      } else {
+        lines.push(prefix + txt);
+      }
+    } else if (flavour === "affine:list") {
+      lines.push(prefix + "- " + txt);
+    } else if (flavour === "affine:code") {
+      const lang = block.get("prop:language") || "";
+      lines.push("```" + lang + "\n" + txt + "\n```");
+    } else if (flavour === "affine:image") {
+      const sid = block.get("prop:sourceId") || "";
+      lines.push(`![image](${sourceIdMap.get(sid) || sid})`);
+    } else if (flavour === "affine:attachment") {
+      const sid = block.get("prop:sourceId") || "";
+      const name = block.get("prop:name") || "file";
+      lines.push(`📎 [${name}](${sourceIdMap.get(sid) || sid})`);
+    }
+    // Recurse into nested children (e.g. nested lists)
+    const nested = blockChildrenToMarkdown(childId, blocks, sourceIdMap, indent + 1);
+    if (nested) lines.push(nested);
+  }
+  return lines.join("\n\n");
 }
