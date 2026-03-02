@@ -5,6 +5,108 @@
  */
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
+import * as Y from "yjs";
+import { extractMarkdownOrdered } from "../src/tools/moveDocs.js";
+
+// ── extractMarkdownOrdered tests ──
+
+describe("extractMarkdownOrdered", () => {
+  function makeDoc(blockDefs: Array<{ flavour: string; text?: string; type?: string }>) {
+    const ydoc = new Y.Doc();
+    const blocks = ydoc.getMap<any>("blocks");
+    const noteId = "note-1";
+    const noteBlock = new Y.Map<any>();
+    const noteChildren = new Y.Array<string>();
+    noteBlock.set("sys:flavour", "affine:note");
+    noteBlock.set("sys:children", noteChildren);
+    blocks.set(noteId, noteBlock);
+
+    for (let i = 0; i < blockDefs.length; i++) {
+      const def = blockDefs[i];
+      const id = `block-${i}`;
+      const block = new Y.Map<any>();
+      block.set("sys:flavour", def.flavour);
+      if (def.text !== undefined) {
+        const yt = new Y.Text();
+        yt.insert(0, def.text);
+        block.set("prop:text", yt);
+      }
+      if (def.type) block.set("prop:type", def.type);
+      block.set("sys:children", new Y.Array());
+      blocks.set(id, block);
+      noteChildren.push([id]);
+    }
+    return blocks;
+  }
+
+  it("preserves block order from sys:children", () => {
+    const ydoc = new Y.Doc();
+    const blocks = ydoc.getMap<any>("blocks");
+    const noteId = "note-1";
+    const noteBlock = new Y.Map<any>();
+    const noteChildren = new Y.Array<string>();
+    noteBlock.set("sys:flavour", "affine:note");
+    noteBlock.set("sys:children", noteChildren);
+    blocks.set(noteId, noteBlock);
+
+    // Insert blocks in reverse order into the map — order must come from sys:children
+    for (const [id, text] of [["b3", "Third"], ["b2", "Second"], ["b1", "First"]] as const) {
+      const block = new Y.Map<any>();
+      block.set("sys:flavour", "affine:paragraph");
+      block.set("prop:type", "text");
+      const yt = new Y.Text(); yt.insert(0, text);
+      block.set("prop:text", yt);
+      block.set("sys:children", new Y.Array());
+      blocks.set(id, block);
+    }
+    // sys:children in correct order
+    noteChildren.push(["b1"]); noteChildren.push(["b2"]); noteChildren.push(["b3"]);
+
+    const md = extractMarkdownOrdered(blocks, new Map());
+    const parts = md.split(/\n\n+/).filter(Boolean);
+    assert.deepEqual(parts, ["First", "Second", "Third"]);
+  });
+
+  it("renders headings with correct level", () => {
+    const blocks = makeDoc([
+      { flavour: "affine:paragraph", text: "Title", type: "h1" },
+      { flavour: "affine:paragraph", text: "Sub", type: "h2" },
+      { flavour: "affine:paragraph", text: "Body", type: "text" },
+    ]);
+    const md = extractMarkdownOrdered(blocks, new Map());
+    assert.ok(md.includes("# Title"), `expected h1, got: ${md}`);
+    assert.ok(md.includes("## Sub"), `expected h2, got: ${md}`);
+    assert.ok(md.includes("Body"), `expected body, got: ${md}`);
+  });
+
+  it("remaps image sourceIds", () => {
+    const ydoc = new Y.Doc();
+    const blocks = ydoc.getMap<any>("blocks");
+    const noteId = "note-1";
+    const noteBlock = new Y.Map<any>();
+    const noteChildren = new Y.Array<string>();
+    noteBlock.set("sys:flavour", "affine:note");
+    noteBlock.set("sys:children", noteChildren);
+    blocks.set(noteId, noteBlock);
+
+    const imgBlock = new Y.Map<any>();
+    imgBlock.set("sys:flavour", "affine:image");
+    imgBlock.set("prop:sourceId", "old-key");
+    imgBlock.set("sys:children", new Y.Array());
+    blocks.set("img-1", imgBlock);
+    noteChildren.push(["img-1"]);
+
+    const md = extractMarkdownOrdered(blocks, new Map([["old-key", "new-key"]]));
+    assert.ok(md.includes("new-key"), `expected remapped key, got: ${md}`);
+  });
+
+  it("returns empty string when no note block", () => {
+    const ydoc = new Y.Doc();
+    const blocks = ydoc.getMap<any>("blocks");
+    const md = extractMarkdownOrdered(blocks, new Map());
+    assert.equal(md, "");
+  });
+});
 
 // ── read_blob tests ──
 
