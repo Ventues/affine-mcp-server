@@ -2085,7 +2085,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     "write_doc_from_markdown",
     {
       title: "Write Document from Markdown",
-      description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview.",
+      description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview. IMPORTANT: attachment blocks are represented as '📎 filename' lines in markdown — if you omit them from the markdown you pass in, they will be permanently dropped. Always include '📎 filename' lines for any attachments that should be preserved.",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
         docId: DocId,
