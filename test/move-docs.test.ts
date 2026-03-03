@@ -6,7 +6,7 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import * as Y from "yjs";
-import { extractMarkdownOrdered } from "../src/tools/moveDocs.js";
+import { extractMarkdownOrdered, countContentBlocks } from "../src/tools/moveDocs.js";
 
 // ── extractMarkdownOrdered tests ──
 
@@ -425,6 +425,124 @@ describe("move_docs", () => {
     assert.equal(createdFolders[0].name, "ParentFolder");
     assert.notEqual(addedToFolders[0], "target-root");
   });
+
+  // ── contentIntact tests ──
+
+  it("same-workspace move always returns contentIntact: true", async () => {
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async () => {},
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+    };
+    const results = await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "f1",
+      targetWorkspaceId: "ws1",
+    }, deps);
+    assert.equal(results[0].contentIntact, true);
+  });
+
+  it("cross-workspace: contentIntact true when block counts match", async () => {
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [
+        { id: "b1", flavour: "affine:paragraph" },
+        { id: "b2", flavour: "affine:paragraph" },
+      ],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "# Hello",
+      addDocToFolder: async () => {},
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      countDestBlocks: async () => 2,
+    };
+    const results = await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "f1",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+    }, deps);
+    assert.equal(results[0].contentIntact, true);
+  });
+
+  it("cross-workspace: contentIntact false when dest has fewer blocks", async () => {
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [
+        { id: "b1", flavour: "affine:paragraph" },
+        { id: "b2", flavour: "affine:paragraph" },
+        { id: "b3", flavour: "affine:paragraph" },
+      ],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "# Hello",
+      addDocToFolder: async () => {},
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      countDestBlocks: async () => 1,
+    };
+    const results = await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "f1",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+    }, deps);
+    assert.equal(results[0].contentIntact, false);
+  });
+
+  it("cross-workspace: contentIntact true when source has no content blocks", async () => {
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async () => {},
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      countDestBlocks: async () => 0,
+    };
+    const results = await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "f1",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+    }, deps);
+    assert.equal(results[0].contentIntact, true);
+  });
+
+  it("error result has contentIntact: false", async () => {
+    const deps: MoveDeps = {
+      readBlob: async () => { throw new Error("fail"); },
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [{ id: "b1", flavour: "affine:image", sourceId: "blob-1" }],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async () => {},
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+    };
+    const results = await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "f1",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+      onBlobError: "abort",
+    }, deps);
+    assert.equal(results[0].status, "error");
+    assert.equal(results[0].contentIntact, false);
+  });
 });
 
 // ── Inline implementations for testing (extracted core logic) ──
@@ -458,6 +576,7 @@ interface MoveDeps {
   moveToFolder: (docIds: string[], folderId: string, wsId: string) => Promise<void>;
   ensureFolderPath?: (wsId: string, rootFolderId: string, pathNames: string[]) => Promise<string>;
   getFolderEntries?: (wsId: string) => Promise<Array<{ id: string; parentId: string | null; type: string; data: string; index: string }>>;
+  countDestBlocks?: (docId: string, wsId: string) => Promise<number>;
 }
 
 interface MoveDocsParams {
@@ -476,6 +595,7 @@ interface MoveResult {
   newDocId?: string;
   blobsTransferred: number;
   blobsFailed: number;
+  contentIntact: boolean;
   error?: string;
 }
 
@@ -491,12 +611,12 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
         const path = getFolderPathForDoc(entries, docId);
         const folderId = await deps.ensureFolderPath(targetWorkspaceId, targetFolderId, path);
         await deps.addDocToFolder(docId, folderId, targetWorkspaceId);
-        results.push({ docId, status: "success" as const, blobsTransferred: 0, blobsFailed: 0 });
+        results.push({ docId, status: "success" as const, blobsTransferred: 0, blobsFailed: 0, contentIntact: true });
       }
       return results;
     }
     await deps.moveToFolder(docIds, targetFolderId, targetWorkspaceId);
-    return docIds.map(id => ({ docId: id, status: "success" as const, blobsTransferred: 0, blobsFailed: 0 }));
+    return docIds.map(id => ({ docId: id, status: "success" as const, blobsTransferred: 0, blobsFailed: 0, contentIntact: true }));
   }
 
   // Read source folder entries once if preserving structure
@@ -527,7 +647,7 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
           sourceIdMap.set(oldKey, newKey);
         } catch (err: any) {
           if (onBlobError === "abort") {
-            results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
+            results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, contentIntact: false, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
             break;
           }
           blobsFailed++;
@@ -538,6 +658,7 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
 
       // 3. Read markdown + create doc in target
       const markdown = await deps.readDocMarkdown(docId, sourceWorkspaceId!);
+      const sourceBlockCount = (await deps.readDocBlocks(docId, sourceWorkspaceId!)).length;
       const newDocId = await deps.createDoc(targetWorkspaceId);
 
       // 4. Write content
@@ -554,10 +675,12 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
         await deps.deleteDoc(docId, sourceWorkspaceId!);
       }
 
+      const destBlockCount = deps.countDestBlocks ? await deps.countDestBlocks(newDocId, targetWorkspaceId) : sourceBlockCount;
+      const contentIntact = sourceBlockCount === 0 || sourceBlockCount === destBlockCount;
       const status = blobsFailed > 0 ? "partial" : "success";
-      results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed });
+      results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed, contentIntact });
     } catch (err: any) {
-      results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
+      results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, contentIntact: false, error: err.message });
     }
   }
   return results;

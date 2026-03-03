@@ -19,7 +19,16 @@ import {
 
 interface BlobResult { key: string; contentType: string; content: string }
 interface BlockInfo { id: string; flavour: string; sourceId?: string }
-interface MoveResult { docId: string; status: "success" | "error" | "partial"; newDocId?: string; blobsTransferred: number; blobsFailed: number; error?: string }
+interface MoveResult { docId: string; status: "success" | "error" | "partial"; newDocId?: string; blobsTransferred: number; blobsFailed: number; contentIntact: boolean; error?: string }
+
+const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+export function countContentBlocks(blocks: Y.Map<any>): number {
+  let count = 0;
+  blocks.forEach((block: any) => {
+    if (block instanceof Y.Map && !STRUCTURAL_FLAVOURS.has(block.get("sys:flavour"))) count++;
+  });
+  return count;
+}
 
 export async function readBlobCore(gql: GraphQLClient, workspaceId: string, key: string): Promise<BlobResult> {
   const baseUrl = gql.endpoint.replace(/\/graphql$/, '');
@@ -154,9 +163,9 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
           // For same-workspace, we just move the folder link
           // Import and call moveNodeHandler would be circular, so use the organize doc approach
           await gql.request(addDocMutation, { workspaceId: targetWorkspaceId, docId, folderId });
-          results.push({ docId, status: "success", blobsTransferred: 0, blobsFailed: 0 });
+          results.push({ docId, status: "success", blobsTransferred: 0, blobsFailed: 0, contentIntact: true });
         } catch (err: any) {
-          results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
+          results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, contentIntact: false, error: err.message });
         }
       }
       return text(results);
@@ -190,7 +199,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
             sourceIdMap.set(oldKey, newKey);
           } catch (err: any) {
             if (onBlobError === "abort") {
-              results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
+              results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, contentIntact: false, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
               aborted = true;
               break;
             }
@@ -209,6 +218,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
         const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         let markdown = "";
         let title = "";
+        let sourceBlockCount = 0;
         try {
           await joinWorkspace(socket, sourceWorkspaceId!);
           const snapshot = await loadDoc(socket, sourceWorkspaceId!, docId);
@@ -216,6 +226,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
             const doc = new Y.Doc();
             Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
             const blocks = doc.getMap("blocks") as Y.Map<any>;
+            sourceBlockCount = countContentBlocks(blocks);
             // Extract title from page block
             blocks.forEach((block: any) => {
               if (!(block instanceof Y.Map)) return;
@@ -241,6 +252,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
         const newDocId = createResult.createDoc.id;
 
         // 5. Write markdown content to new doc via WebSocket
+        let destBlockCount = 0;
         if (markdown) {
           const socket2 = await connectWorkspaceSocket(wsUrl, authHeaders);
           try {
@@ -255,6 +267,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
                 const noteBlock = blocks.get(noteId) as Y.Map<any>;
                 const noteChildren = noteBlock.get("sys:children") as Y.Array<string>;
                 applyMarkdownToNote(markdown, noteId, blocks, noteChildren);
+                destBlockCount = countContentBlocks(blocks);
                 const update = Y.encodeStateAsUpdate(doc);
                 await pushDocUpdate(socket2, targetWorkspaceId, newDocId, Buffer.from(update).toString("base64"));
               }
@@ -286,9 +299,10 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
         }
 
         const status = blobsFailed > 0 ? "partial" : "success";
-        results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed });
+        const contentIntact = sourceBlockCount === 0 || sourceBlockCount === destBlockCount;
+        results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed, contentIntact });
       } catch (err: any) {
-        results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
+        results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, contentIntact: false, error: err.message });
       }
     }
     return text(results);
