@@ -13,7 +13,7 @@ import * as Y from "yjs";
 import { generateKeyBetween } from "fractional-indexing";
 import { randomBytes } from "node:crypto";
 
-function generateNodeId(): string {
+export function generateNodeId(): string {
   const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
   let id = "";
   for (let i = 0; i < 21; i++) id += chars.charAt(Math.floor(Math.random() * chars.length));
@@ -24,7 +24,7 @@ const FOLDERS_TABLE = "folders";
 const DELETED_FLAG = "$$DELETED";
 const RANDOM_SUFFIX_LEN = 32;
 
-type FolderEntry = {
+export type FolderEntry = {
   id: string;
   parentId: string | null;
   type: "folder" | "doc" | "tag" | "collection";
@@ -53,7 +53,7 @@ function hasSamePrefix(a: string, b: string): boolean {
   return a.startsWith(b) || b.startsWith(a);
 }
 
-function generateIndexBetween(a: string | null, b: string | null): string {
+export function generateIndexBetween(a: string | null, b: string | null): string {
   if (a !== null && b !== null && a >= b) {
     throw new Error("a should be smaller than b");
   }
@@ -77,7 +77,7 @@ function generateIndexBetween(a: string | null, b: string | null): string {
 
 // --- Yjs helpers for the folders DB doc ---
 
-function readAllEntries(doc: Y.Doc): FolderEntry[] {
+export function readAllEntries(doc: Y.Doc): FolderEntry[] {
   const entries: FolderEntry[] = [];
   for (const [key] of doc.share) {
     const m = doc.getMap(key);
@@ -95,7 +95,7 @@ function readAllEntries(doc: Y.Doc): FolderEntry[] {
   return entries;
 }
 
-function getEntry(doc: Y.Doc, nodeId: string): FolderEntry | null {
+export function getEntry(doc: Y.Doc, nodeId: string): FolderEntry | null {
   if (!doc.share.has(nodeId)) return null;
   const m = doc.getMap(nodeId);
   if (m.get(DELETED_FLAG) === true) return null;
@@ -110,13 +110,13 @@ function getEntry(doc: Y.Doc, nodeId: string): FolderEntry | null {
   };
 }
 
-function getChildren(doc: Y.Doc, parentId: string | null): FolderEntry[] {
+export function getChildren(doc: Y.Doc, parentId: string | null): FolderEntry[] {
   return readAllEntries(doc)
     .filter((e) => e.parentId === parentId)
     .sort((a, b) => (a.index > b.index ? 1 : -1));
 }
 
-function insertEntry(doc: Y.Doc, entry: FolderEntry) {
+export function insertEntry(doc: Y.Doc, entry: FolderEntry) {
   const m = doc.getMap(entry.id);
   doc.transact(() => {
     m.set("id", entry.id);
@@ -203,7 +203,7 @@ async function resolveDocTitles(gql: GraphQLClient, workspaceId: string, docIds:
 }
 
 // --- Socket helper ---
-async function withFoldersDoc<T>(
+export async function withFoldersDoc<T>(
   gql: GraphQLClient,
   workspaceId: string,
   fn: (doc: Y.Doc, prevSV: Uint8Array) => T

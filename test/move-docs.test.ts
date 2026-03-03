@@ -272,6 +272,159 @@ describe("move_docs", () => {
     assert.equal(transferCount, 2); // same-blob once + different-blob once
     assert.equal(results[0].blobsTransferred, 2);
   });
+
+  it("preserveFolderStructure=false (default) uses flat targetFolderId", async () => {
+    const addedToFolders: string[] = [];
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async (docId, folderId) => { addedToFolders.push(folderId); },
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+    };
+    await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "root-folder",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+    }, deps);
+    assert.deepEqual(addedToFolders, ["root-folder"]);
+  });
+
+  it("preserveFolderStructure: cross-workspace recreates subfolder path", async () => {
+    const addedToFolders: string[] = [];
+    const createdFolders: Array<{ parentId: string; name: string }> = [];
+    let folderIdCounter = 100;
+
+    const sourceEntries = [
+      { id: "folder-a", parentId: null, type: "folder", data: "ParentFolder", index: "a0" },
+      { id: "folder-b", parentId: "folder-a", type: "folder", data: "SubFolder", index: "a0" },
+      { id: "link-doc1", parentId: "folder-b", type: "doc", data: "doc1", index: "a0" },
+    ];
+
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async (docId, folderId) => { addedToFolders.push(folderId); },
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      getFolderEntries: async () => sourceEntries,
+      ensureFolderPath: async (wsId, rootFolderId, pathNames) => {
+        let current = rootFolderId;
+        for (const name of pathNames) {
+          const id = `created-${++folderIdCounter}`;
+          createdFolders.push({ parentId: current, name });
+          current = id;
+        }
+        return current;
+      },
+    };
+
+    await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "target-root",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+      preserveFolderStructure: true,
+    }, deps);
+
+    assert.equal(createdFolders.length, 2);
+    assert.equal(createdFolders[0].name, "ParentFolder");
+    assert.equal(createdFolders[0].parentId, "target-root");
+    assert.equal(createdFolders[1].name, "SubFolder");
+    // doc placed in leaf folder, not target-root
+    assert.notEqual(addedToFolders[0], "target-root");
+  });
+
+  it("preserveFolderStructure: doc at root placed directly in targetFolderId", async () => {
+    const addedToFolders: string[] = [];
+    const createdFolders: string[] = [];
+
+    const sourceEntries = [
+      { id: "link-doc1", parentId: null, type: "doc", data: "doc1", index: "a0" },
+    ];
+
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async (docId, folderId) => { addedToFolders.push(folderId); },
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      getFolderEntries: async () => sourceEntries,
+      ensureFolderPath: async (wsId, rootFolderId, pathNames) => {
+        for (const n of pathNames) createdFolders.push(n);
+        return rootFolderId;
+      },
+    };
+
+    await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "target-root",
+      targetWorkspaceId: "ws2",
+      sourceWorkspaceId: "ws1",
+      preserveFolderStructure: true,
+    }, deps);
+
+    assert.equal(createdFolders.length, 0);
+    assert.deepEqual(addedToFolders, ["target-root"]);
+  });
+
+  it("preserveFolderStructure: same-workspace recreates subfolder path", async () => {
+    const addedToFolders: string[] = [];
+    const createdFolders: Array<{ parentId: string; name: string }> = [];
+    let counter = 0;
+
+    const targetEntries = [
+      { id: "folder-a", parentId: null, type: "folder", data: "ParentFolder", index: "a0" },
+      { id: "folder-b", parentId: "folder-a", type: "folder", data: "SubFolder", index: "a0" },
+      { id: "link-doc1", parentId: "folder-b", type: "doc", data: "doc1", index: "a0" },
+    ];
+
+    const deps: MoveDeps = {
+      readBlob: async (k) => ({ key: k, contentType: "text/plain", content: "" }),
+      uploadBlob: async () => "k",
+      readDocBlocks: async () => [],
+      createDoc: async () => "new-doc",
+      writeDocMarkdown: async () => {},
+      readDocMarkdown: async () => "",
+      addDocToFolder: async (docId, folderId) => { addedToFolders.push(folderId); },
+      deleteDoc: async () => {},
+      moveToFolder: async () => {},
+      getFolderEntries: async () => targetEntries,
+      ensureFolderPath: async (wsId, rootFolderId, pathNames) => {
+        let current = rootFolderId;
+        for (const name of pathNames) {
+          const id = `created-${++counter}`;
+          createdFolders.push({ parentId: current, name });
+          current = id;
+        }
+        return current;
+      },
+    };
+
+    await moveDocsCore({
+      docIds: ["doc1"],
+      targetFolderId: "target-root",
+      targetWorkspaceId: "ws1",
+      preserveFolderStructure: true,
+    }, deps);
+
+    assert.equal(createdFolders.length, 2);
+    assert.equal(createdFolders[0].name, "ParentFolder");
+    assert.notEqual(addedToFolders[0], "target-root");
+  });
 });
 
 // ── Inline implementations for testing (extracted core logic) ──
@@ -303,6 +456,8 @@ interface MoveDeps {
   addDocToFolder: (docId: string, folderId: string, wsId: string) => Promise<void>;
   deleteDoc: (docId: string, wsId: string) => Promise<void>;
   moveToFolder: (docIds: string[], folderId: string, wsId: string) => Promise<void>;
+  ensureFolderPath?: (wsId: string, rootFolderId: string, pathNames: string[]) => Promise<string>;
+  getFolderEntries?: (wsId: string) => Promise<Array<{ id: string; parentId: string | null; type: string; data: string; index: string }>>;
 }
 
 interface MoveDocsParams {
@@ -312,6 +467,7 @@ interface MoveDocsParams {
   sourceWorkspaceId?: string;
   removeFromSource?: boolean;
   onBlobError?: "abort" | "skip";
+  preserveFolderStructure?: boolean;
 }
 
 interface MoveResult {
@@ -324,12 +480,29 @@ interface MoveResult {
 }
 
 async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<MoveResult[]> {
-  const { docIds, targetFolderId, targetWorkspaceId, sourceWorkspaceId, removeFromSource = true, onBlobError = "abort" } = params;
+  const { docIds, targetFolderId, targetWorkspaceId, sourceWorkspaceId, removeFromSource = true, onBlobError = "abort", preserveFolderStructure = false } = params;
   const isSameWorkspace = !sourceWorkspaceId || sourceWorkspaceId === targetWorkspaceId;
 
   if (isSameWorkspace) {
+    if (preserveFolderStructure && deps.getFolderEntries && deps.ensureFolderPath) {
+      const entries = await deps.getFolderEntries(targetWorkspaceId);
+      const results: MoveResult[] = [];
+      for (const docId of docIds) {
+        const path = getFolderPathForDoc(entries, docId);
+        const folderId = await deps.ensureFolderPath(targetWorkspaceId, targetFolderId, path);
+        await deps.addDocToFolder(docId, folderId, targetWorkspaceId);
+        results.push({ docId, status: "success" as const, blobsTransferred: 0, blobsFailed: 0 });
+      }
+      return results;
+    }
     await deps.moveToFolder(docIds, targetFolderId, targetWorkspaceId);
     return docIds.map(id => ({ docId: id, status: "success" as const, blobsTransferred: 0, blobsFailed: 0 }));
+  }
+
+  // Read source folder entries once if preserving structure
+  let sourceEntries: Array<{ id: string; parentId: string | null; type: string; data: string; index: string }> = [];
+  if (preserveFolderStructure && deps.getFolderEntries) {
+    sourceEntries = await deps.getFolderEntries(sourceWorkspaceId!);
   }
 
   const results: MoveResult[] = [];
@@ -367,11 +540,14 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
       const markdown = await deps.readDocMarkdown(docId, sourceWorkspaceId!);
       const newDocId = await deps.createDoc(targetWorkspaceId);
 
-      // 4. Write content (sourceId remapping happens at block level, markdown is content)
+      // 4. Write content
       await deps.writeDocMarkdown(newDocId, targetWorkspaceId, markdown);
 
-      // 5. Add to folder
-      await deps.addDocToFolder(newDocId, targetFolderId, targetWorkspaceId);
+      // 5. Add to folder (with optional structure preservation)
+      const destFolderId = (preserveFolderStructure && deps.ensureFolderPath)
+        ? await deps.ensureFolderPath(targetWorkspaceId, targetFolderId, getFolderPathForDoc(sourceEntries, docId))
+        : targetFolderId;
+      await deps.addDocToFolder(newDocId, destFolderId, targetWorkspaceId);
 
       // 6. Remove from source
       if (removeFromSource) {
@@ -385,4 +561,22 @@ async function moveDocsCore(params: MoveDocsParams, deps: MoveDeps): Promise<Mov
     }
   }
   return results;
+}
+
+// ── getFolderPathForDoc (inline for tests) ──
+function getFolderPathForDoc(
+  entries: Array<{ id: string; parentId: string | null; type: string; data: string; index: string }>,
+  docId: string
+): string[] {
+  const docEntry = entries.find(e => e.type === "doc" && e.data === docId);
+  if (!docEntry || !docEntry.parentId) return [];
+  const path: string[] = [];
+  let current: string | null = docEntry.parentId;
+  while (current) {
+    const folder = entries.find(e => e.id === current && e.type === "folder");
+    if (!folder) break;
+    path.unshift(folder.data);
+    current = folder.parentId;
+  }
+  return path;
 }

@@ -6,6 +6,16 @@ import fetch from "node-fetch";
 import * as Y from "yjs";
 import { connectWorkspaceSocket, wsUrlFromGraphQLEndpoint, joinWorkspace, loadDoc, pushDocUpdate } from "../ws.js";
 import { applyMarkdownToNote } from "../util/blocks.js";
+import {
+  withFoldersDoc,
+  readAllEntries,
+  getChildren,
+  getEntry,
+  insertEntry,
+  generateIndexBetween,
+  generateNodeId,
+  FolderEntry,
+} from "./organize.js";
 
 interface BlobResult { key: string; contentType: string; content: string }
 interface BlockInfo { id: string; flavour: string; sourceId?: string }
@@ -50,6 +60,45 @@ function getEndpointAndAuth(gql: GraphQLClient) {
   return { endpoint: gql.endpoint, authHeaders: gql.getAuthHeaders() };
 }
 
+/** Returns ordered folder names from root down to the immediate parent of docId. */
+export function getFolderPathForDoc(entries: FolderEntry[], docId: string): string[] {
+  const docEntry = entries.find(e => e.type === "doc" && e.data === docId);
+  if (!docEntry || !docEntry.parentId) return [];
+  const path: string[] = [];
+  let current: string | null = docEntry.parentId;
+  while (current) {
+    const folder = entries.find(e => e.id === current && e.type === "folder");
+    if (!folder) break;
+    path.unshift(folder.data);
+    current = folder.parentId;
+  }
+  return path;
+}
+
+/** Walks/creates folders under rootFolderId matching pathNames, returns leaf folder ID. */
+export async function ensureFolderPath(
+  gql: GraphQLClient,
+  workspaceId: string,
+  rootFolderId: string,
+  pathNames: string[]
+): Promise<string> {
+  if (pathNames.length === 0) return rootFolderId;
+  let currentParentId = rootFolderId;
+  for (const name of pathNames) {
+    currentParentId = await withFoldersDoc(gql, workspaceId, (doc) => {
+      const children = getChildren(doc, currentParentId);
+      const existing = children.find(c => c.type === "folder" && c.data === name);
+      if (existing) return existing.id;
+      const lastIndex = children.length > 0 ? children[children.length - 1].index : null;
+      const index = generateIndexBetween(lastIndex, null);
+      const id = generateNodeId();
+      insertEntry(doc, { id, parentId: currentParentId, type: "folder", data: name, index });
+      return id;
+    });
+  }
+  return currentParentId;
+}
+
 async function uploadBlobToWorkspace(gql: GraphQLClient, workspaceId: string, content: string, contentType: string): Promise<string> {
   const FormData = (await import("form-data")).default;
   const payload = Buffer.from(content, "base64");
@@ -78,8 +127,9 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
     sourceWorkspaceId?: string;
     removeFromSource?: boolean;
     onBlobError?: "abort" | "skip";
+    preserveFolderStructure?: boolean;
   }) => {
-    const { docIds, targetFolderId, targetWorkspaceId, sourceWorkspaceId, removeFromSource = true, onBlobError = "abort" } = parsed;
+    const { docIds, targetFolderId, targetWorkspaceId, sourceWorkspaceId, removeFromSource = true, onBlobError = "abort", preserveFolderStructure = false } = parsed;
     const isSameWorkspace = !sourceWorkspaceId || sourceWorkspaceId === targetWorkspaceId;
 
     if (isSameWorkspace) {
@@ -89,11 +139,21 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
         addDocToFolder(workspaceId: $workspaceId, docId: $docId, folderId: $folderId)
       }`;
       const results: MoveResult[] = [];
+
+      // Read source folder entries once if preserving structure
+      let sourceEntries: FolderEntry[] = [];
+      if (preserveFolderStructure) {
+        sourceEntries = await withFoldersDoc(gql, targetWorkspaceId, (doc) => readAllEntries(doc));
+      }
+
       for (const docId of docIds) {
         try {
+          const folderId = preserveFolderStructure
+            ? await ensureFolderPath(gql, targetWorkspaceId, targetFolderId, getFolderPathForDoc(sourceEntries, docId))
+            : targetFolderId;
           // For same-workspace, we just move the folder link
           // Import and call moveNodeHandler would be circular, so use the organize doc approach
-          await gql.request(addDocMutation, { workspaceId: targetWorkspaceId, docId, folderId: targetFolderId });
+          await gql.request(addDocMutation, { workspaceId: targetWorkspaceId, docId, folderId });
           results.push({ docId, status: "success", blobsTransferred: 0, blobsFailed: 0 });
         } catch (err: any) {
           results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
@@ -103,6 +163,12 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
     }
 
     // Cross-workspace path
+    // Read source folder entries once if preserving structure
+    let sourceEntries: FolderEntry[] = [];
+    if (preserveFolderStructure) {
+      sourceEntries = await withFoldersDoc(gql, sourceWorkspaceId!, (doc) => readAllEntries(doc));
+    }
+
     const results: MoveResult[] = [];
     for (const docId of docIds) {
       try {
@@ -203,7 +269,10 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
           const addMutation = `mutation AddDocToFolder($workspaceId: String!, $docId: String!, $folderId: String!) {
             addDocToFolder(workspaceId: $workspaceId, docId: $docId, folderId: $folderId)
           }`;
-          await gql.request(addMutation, { workspaceId: targetWorkspaceId, docId: newDocId, folderId: targetFolderId });
+          const destFolderId = preserveFolderStructure
+            ? await ensureFolderPath(gql, targetWorkspaceId, targetFolderId, getFolderPathForDoc(sourceEntries, docId))
+            : targetFolderId;
+          await gql.request(addMutation, { workspaceId: targetWorkspaceId, docId: newDocId, folderId: destFolderId });
         } catch {}
 
         // 7. Remove from source
@@ -237,6 +306,7 @@ export function registerMoveDocsTools(server: McpServer, gql: GraphQLClient, def
         sourceWorkspaceId: z.string().optional().describe("Source workspace ID (omit for same-workspace)"),
         removeFromSource: z.boolean().optional().describe("Remove from source after move (default true)"),
         onBlobError: z.enum(["abort", "skip"]).optional().describe("Blob error handling: abort (default) or skip"),
+        preserveFolderStructure: z.boolean().optional().describe("Recreate source subfolder structure under targetFolderId (default false)"),
       }
     },
     moveDocsHandler as any

@@ -4,7 +4,7 @@ import { wsUrlFromGraphQLEndpoint, connectWorkspaceSocket, joinWorkspace, loadDo
 import * as Y from "yjs";
 import { generateKeyBetween } from "fractional-indexing";
 import { randomBytes } from "node:crypto";
-function generateNodeId() {
+export function generateNodeId() {
     const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-";
     let id = "";
     for (let i = 0; i < 21; i++)
@@ -34,7 +34,7 @@ function subkey(key) {
 function hasSamePrefix(a, b) {
     return a.startsWith(b) || b.startsWith(a);
 }
-function generateIndexBetween(a, b) {
+export function generateIndexBetween(a, b) {
     if (a !== null && b !== null && a >= b) {
         throw new Error("a should be smaller than b");
     }
@@ -60,7 +60,7 @@ function generateIndexBetween(a, b) {
     throw new Error("Never reach here");
 }
 // --- Yjs helpers for the folders DB doc ---
-function readAllEntries(doc) {
+export function readAllEntries(doc) {
     const entries = [];
     for (const [key] of doc.share) {
         const m = doc.getMap(key);
@@ -79,7 +79,7 @@ function readAllEntries(doc) {
     }
     return entries;
 }
-function getEntry(doc, nodeId) {
+export function getEntry(doc, nodeId) {
     if (!doc.share.has(nodeId))
         return null;
     const m = doc.getMap(nodeId);
@@ -96,12 +96,12 @@ function getEntry(doc, nodeId) {
         index: m.get("index") ?? "a0",
     };
 }
-function getChildren(doc, parentId) {
+export function getChildren(doc, parentId) {
     return readAllEntries(doc)
         .filter((e) => e.parentId === parentId)
         .sort((a, b) => (a.index > b.index ? 1 : -1));
 }
-function insertEntry(doc, entry) {
+export function insertEntry(doc, entry) {
     const m = doc.getMap(entry.id);
     doc.transact(() => {
         m.set("id", entry.id);
@@ -188,7 +188,7 @@ async function resolveDocTitles(gql, workspaceId, docIds) {
     return titleMap;
 }
 // --- Socket helper ---
-async function withFoldersDoc(gql, workspaceId, fn) {
+export async function withFoldersDoc(gql, workspaceId, fn) {
     const endpoint = gql.endpoint;
     const authHeaders = gql.getAuthHeaders();
     const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
