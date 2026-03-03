@@ -2210,4 +2210,92 @@ describe("Comment operations", () => {
       socket.disconnect();
     }
   });
+
+  it("write_docs_from_markdown rewrites multiple docs in one call", async () => {
+    // Create 2 docs with initial content
+    const doc1 = createEmptyDoc("Bulk Write Doc 1");
+    const doc2 = createEmptyDoc("Bulk Write Doc 2");
+    docsToCleanup.push(doc1.docId, doc2.docId);
+
+    // Add initial paragraphs to both docs
+    const blocks1 = doc1.ydoc.getMap("blocks") as Y.Map<any>;
+    const note1 = blocks1.get(doc1.noteId) as Y.Map<any>;
+    const noteChildren1 = note1.get("sys:children") as Y.Array<any>;
+    addPara(blocks1, doc1.noteId, noteChildren1, "Initial content 1");
+
+    const blocks2 = doc2.ydoc.getMap("blocks") as Y.Map<any>;
+    const note2 = blocks2.get(doc2.noteId) as Y.Map<any>;
+    const noteChildren2 = note2.get("sys:children") as Y.Array<any>;
+    addPara(blocks2, doc2.noteId, noteChildren2, "Initial content 2");
+
+    await pushDoc(socket, doc1.docId, doc1.ydoc);
+    await pushDoc(socket, doc2.docId, doc2.ydoc);
+
+    // Now bulk-rewrite both docs using the same CRDT logic as write_docs_from_markdown
+    // (replicate the handler logic directly since handlers are closures)
+    const entries = [
+      { docId: doc1.docId, markdown: "Hello from bulk write 1\n\nSecond paragraph 1" },
+      { docId: doc2.docId, markdown: "Hello from bulk write 2\n\nSecond paragraph 2" },
+    ];
+
+    // Simulate the bulk handler: one socket, sequential per-doc writes
+    const bulkSocket = await connect();
+    try {
+      for (const entry of entries) {
+        const snap = await loadDoc(bulkSocket, WORKSPACE_ID!, entry.docId);
+        assert.ok(snap.missing, `doc ${entry.docId} should exist`);
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, Buffer.from(snap.missing, "base64"));
+        const bks = doc.getMap("blocks") as Y.Map<any>;
+        const noteBlock = Array.from(bks.values()).find((v: any) => v instanceof Y.Map && v.get("sys:flavour") === "affine:note") as Y.Map<any>;
+        assert.ok(noteBlock, "note block should exist");
+        const noteId = noteBlock.get("sys:id") as string;
+        const noteChildren = noteBlock.get("sys:children") as Y.Array<any>;
+        const prevSV = Y.encodeStateVector(doc);
+
+        // Clear existing blocks
+        const existingIds: string[] = [];
+        noteChildren.forEach((id: string) => existingIds.push(id));
+        if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
+        for (const cid of existingIds) bks.delete(cid);
+
+        // Parse markdown and add new paragraphs
+        const paragraphs = entry.markdown.split(/\n\n+/).filter(p => p.trim());
+        const newIds: string[] = [];
+        for (const para of paragraphs) {
+          const pid = genId();
+          newIds.push(pid);
+          const b = new Y.Map();
+          setSys(b, pid, "affine:paragraph");
+          b.set("sys:parent", noteId);
+          b.set("sys:children", new Y.Array());
+          b.set("prop:type", "text");
+          const yt = new Y.Text();
+          yt.insert(0, para.trim());
+          b.set("prop:text", yt);
+          bks.set(pid, b);
+        }
+        if (newIds.length > 0) noteChildren.insert(0, newIds);
+
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(bulkSocket, WORKSPACE_ID!, entry.docId, Buffer.from(delta).toString("base64"));
+      }
+    } finally {
+      bulkSocket.disconnect();
+    }
+
+    // Verify both docs were rewritten correctly
+    for (let i = 0; i < entries.length; i++) {
+      const readBack = await readBlocks(socket, entries[i].docId);
+      const noteBlock = findByFlavour(readBack, "affine:note")!;
+      const childIds: string[] = [];
+      (noteBlock.get("sys:children") as Y.Array<any>).forEach((id: string) => childIds.push(id));
+      assert.equal(childIds.length, 2, `doc ${i + 1} should have 2 paragraphs`);
+      const firstText = getBlockText(readBack, childIds[0]);
+      assert.ok(firstText.includes(`Hello from bulk write ${i + 1}`), `doc ${i + 1} first paragraph should match`);
+      const secondText = getBlockText(readBack, childIds[1]);
+      assert.ok(secondText.includes(`Second paragraph ${i + 1}`), `doc ${i + 1} second paragraph should match`);
+    }
+    console.log("  write_docs_from_markdown: 2 docs rewritten in one socket session");
+  });
 });

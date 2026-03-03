@@ -1978,6 +1978,97 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     }
   }
 
+  /** Inner per-doc logic shared by write_doc_from_markdown and write_docs_from_markdown */
+  async function writeOneDoc(
+    socket: any,
+    workspaceId: string,
+    entry: { docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }
+  ): Promise<object> {
+    const snapshot = await loadDoc(socket, workspaceId, entry.docId);
+    if (!snapshot.missing) throw new Error(`Document '${entry.docId}' not found.`);
+
+    const doc = new Y.Doc();
+    Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+    const blocks = doc.getMap("blocks") as Y.Map<any>;
+    const noteId = findBlockIdByFlavour(blocks, "affine:note");
+    if (!noteId) throw new Error("Document has no note block.");
+
+    if (entry.dryRun) {
+      const noteBlock = blocks.get(noteId) as Y.Map<any>;
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      let title = "";
+      if (pageId) {
+        const pageBlock = blocks.get(pageId) as Y.Map<any>;
+        if (pageBlock) title = asText(pageBlock.get("prop:title"));
+      }
+      const { markdown: currentMd } = blocksToMarkdownWithMap(blocks, noteBlock, title);
+      return { docId: entry.docId, dryRun: true, currentMarkdown: currentMd, newMarkdown: entry.markdown };
+    }
+
+    const prevSV = Y.encodeStateVector(doc);
+    const noteBlock = blocks.get(noteId) as Y.Map<any>;
+    const noteChildren = ensureChildrenArray(noteBlock);
+    const existingChildIds = childIdsFrom(noteChildren);
+
+    const hasBlockFilter = (entry.blockIds && entry.blockIds.length > 0) || entry.blockOffset !== undefined || entry.blockLimit !== undefined;
+
+    let replaceStart = 0;
+    let replaceEnd = existingChildIds.length;
+
+    if (entry.blockIds && entry.blockIds.length > 0) {
+      const idSet = new Set(entry.blockIds);
+      const indices = existingChildIds.map((id, i) => idSet.has(id) ? i : -1).filter(i => i >= 0);
+      if (indices.length > 0) {
+        replaceStart = indices[0];
+        replaceEnd = indices[indices.length - 1] + 1;
+      }
+    } else if (hasBlockFilter) {
+      replaceStart = entry.blockOffset ?? 0;
+      replaceEnd = Math.min(replaceStart + (entry.blockLimit ?? existingChildIds.length), existingChildIds.length);
+    }
+
+    const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
+    const attachMeta = collectAttachmentMeta(blocks, idsToRemove.length > 0 ? idsToRemove : existingChildIds);
+    if (idsToRemove.length > 0) {
+      noteChildren.delete(replaceStart, idsToRemove.length);
+      for (const cid of idsToRemove) removeBlockTree(blocks, cid);
+    } else if (!hasBlockFilter) {
+      if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
+      for (const cid of existingChildIds) removeBlockTree(blocks, cid);
+    }
+
+    let md = entry.markdown;
+    if (!hasBlockFilter) {
+      const pageId = findBlockIdByFlavour(blocks, "affine:page");
+      if (pageId) {
+        const pageBlock = blocks.get(pageId) as Y.Map<any>;
+        const docTitle = asText(pageBlock?.get("prop:title"));
+        if (docTitle) {
+          const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
+          md = md.replace(titlePattern, "");
+        }
+      }
+    }
+
+    const tempKey = `__temp_${Date.now()}`;
+    const tempChildren = new Y.Array<string>();
+    doc.getMap("__temp").set(tempKey, tempChildren);
+    const mdTokens = mdParser.parse(escapePipes(md), {});
+    markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
+
+    const newIds = tempChildren.toArray();
+    doc.getMap("__temp").delete(tempKey);
+    restoreAttachmentMeta(blocks, newIds, attachMeta);
+    if (newIds.length > 0) noteChildren.insert(replaceStart, newIds);
+
+    const delta = Y.encodeStateAsUpdate(doc, prevSV);
+    await pushDocUpdate(socket, workspaceId, entry.docId, Buffer.from(delta).toString("base64"))
+      .catch(err => { console.error(`pushDocUpdate failed for doc ${entry.docId}:`, err.message); throw err; });
+    await touchDocMeta(socket, workspaceId, entry.docId);
+
+    return { written: true, docId: entry.docId, blocksCreated: noteChildren.length };
+  }
+
   const writeDocFromMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }) => {
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -1987,95 +2078,9 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
-      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
-
-      const doc = new Y.Doc();
-      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const noteId = findBlockIdByFlavour(blocks, "affine:note");
-      if (!noteId) throw new Error("Document has no note block.");
-
-      // Read current markdown for dry run / diff
-      if (parsed.dryRun) {
-        const noteBlock = blocks.get(noteId) as Y.Map<any>;
-        const pageId = findBlockIdByFlavour(blocks, "affine:page");
-        let title = "";
-        if (pageId) {
-          const pageBlock = blocks.get(pageId) as Y.Map<any>;
-          if (pageBlock) title = asText(pageBlock.get("prop:title"));
-        }
-        const { markdown: currentMd } = blocksToMarkdownWithMap(blocks, noteBlock, title);
-        return text({ dryRun: true, currentMarkdown: currentMd, newMarkdown: parsed.markdown });
-      }
-
-      const prevSV = Y.encodeStateVector(doc);
-      const noteBlock = blocks.get(noteId) as Y.Map<any>;
-      const noteChildren = ensureChildrenArray(noteBlock);
-      const existingChildIds = childIdsFrom(noteChildren);
-
-      // Determine which blocks to replace
-      const hasBlockFilter = (parsed.blockIds && parsed.blockIds.length > 0) || parsed.blockOffset !== undefined || parsed.blockLimit !== undefined;
-
-      let replaceStart = 0;
-      let replaceEnd = existingChildIds.length;
-
-      if (parsed.blockIds && parsed.blockIds.length > 0) {
-        const idSet = new Set(parsed.blockIds);
-        const indices = existingChildIds.map((id, i) => idSet.has(id) ? i : -1).filter(i => i >= 0);
-        if (indices.length > 0) {
-          replaceStart = indices[0];
-          replaceEnd = indices[indices.length - 1] + 1;
-        }
-      } else if (hasBlockFilter) {
-        replaceStart = parsed.blockOffset ?? 0;
-        replaceEnd = Math.min(replaceStart + (parsed.blockLimit ?? existingChildIds.length), existingChildIds.length);
-      }
-
-      // Remove the targeted blocks
-      const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
-      const attachMeta = collectAttachmentMeta(blocks, idsToRemove.length > 0 ? idsToRemove : existingChildIds);
-      if (idsToRemove.length > 0) {
-        noteChildren.delete(replaceStart, idsToRemove.length);
-        for (const cid of idsToRemove) removeBlockTree(blocks, cid);
-      } else if (!hasBlockFilter) {
-        // Full replace — clear everything
-        if (noteChildren.length > 0) noteChildren.delete(0, noteChildren.length);
-        for (const cid of existingChildIds) removeBlockTree(blocks, cid);
-      }
-
-      // Parse markdown and create new blocks into a temp array, then splice in
-      let md = parsed.markdown;
-      if (!hasBlockFilter) {
-        const pageId = findBlockIdByFlavour(blocks, "affine:page");
-        if (pageId) {
-          const pageBlock = blocks.get(pageId) as Y.Map<any>;
-          const docTitle = asText(pageBlock?.get("prop:title"));
-          if (docTitle) {
-            const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
-            md = md.replace(titlePattern, "");
-          }
-        }
-      }
-
-      const tempKey = `__temp_${Date.now()}`;
-      const tempChildren = new Y.Array<string>();
-      doc.getMap("__temp").set(tempKey, tempChildren);
-      const mdTokens = mdParser.parse(escapePipes(md), {});
-      markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
-
-      // Insert new blocks at the replace position
-      const newIds = tempChildren.toArray();
-      doc.getMap("__temp").delete(tempKey);
-      restoreAttachmentMeta(blocks, newIds, attachMeta);
-      if (newIds.length > 0) noteChildren.insert(replaceStart, newIds);
-
-      const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-      await touchDocMeta(socket, workspaceId, parsed.docId);
-
-      return text({ written: true, docId: parsed.docId, blocksCreated: noteChildren.length });
+      const result = await writeOneDoc(socket, workspaceId, parsed);
+      if ((result as any).dryRun) return text(result);
+      return text(result);
     } finally {
       socket.disconnect();
     }
@@ -2097,6 +2102,55 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       },
     },
     writeDocFromMarkdownHandler as any
+  );
+
+  // ── write_docs_from_markdown (bulk) ───────────────────────────────────
+  const writeDocsFromMarkdownHandler = async (parsed: {
+    workspaceId?: string;
+    docs: { docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }[];
+  }) => {
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const results: object[] = [];
+      for (const entry of parsed.docs) {
+        try {
+          results.push(await writeOneDoc(socket, workspaceId, entry));
+        } catch (err: any) {
+          results.push({ docId: entry.docId, error: err.message });
+        }
+      }
+      return text({ processed: results.length, results });
+    } finally {
+      socket.disconnect();
+    }
+  };
+
+  const writeDocEntrySchema = z.object({
+    docId: DocId,
+    markdown: z.string().describe("Markdown content to write into the document body"),
+    dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing."),
+    blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
+    blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
+    blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs."),
+  });
+
+  server.registerTool(
+    "write_docs_from_markdown",
+    {
+      title: "Write Multiple Documents from Markdown",
+      description: "Batch rewrite multiple documents in a single WebSocket connection. Accepts an array of {docId, markdown} pairs. Each entry supports the same options as write_doc_from_markdown (dryRun, blockOffset, blockLimit, blockIds). Much faster than calling write_doc_from_markdown multiple times. Per-doc errors are isolated — one failure does not abort the batch.",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        docs: z.array(writeDocEntrySchema).min(1).describe("Array of {docId, markdown, ...options} entries to write"),
+      },
+    },
+    writeDocsFromMarkdownHandler as any
   );
 
   // ── update_doc_markdown (str_replace style partial update) ────────────
