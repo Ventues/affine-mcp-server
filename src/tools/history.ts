@@ -69,7 +69,7 @@ export function registerHistoryTools(server: McpServer, gql: GraphQLClient, defa
     try {
       await joinWorkspace(socket, workspaceId);
       const snapshot = await loadDoc(socket, workspaceId, parsed.guid);
-      if (!snapshot.missing) throw new Error(`Document '${parsed.guid}' not found.`);
+      if (snapshot.missing === undefined) throw new Error(`Document '${parsed.guid}' not found.`);
 
       // 4. Build historical doc to read target state
       const histDoc = new Y.Doc();

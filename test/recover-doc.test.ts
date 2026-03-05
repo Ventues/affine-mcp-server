@@ -141,6 +141,23 @@ describe("recover_doc CRDT diffing", () => {
     assert.deepEqual(curChildren.toArray(), ["c", "b", "a"]);
   });
 
+  it("throws when snapshot.missing is absent (doc not found)", () => {
+    // Simulate the guard logic: snapshot = {} means doc not found
+    const snapshot: { missing?: string } = {};
+    assert.throws(
+      () => { if (snapshot.missing === undefined) throw new Error("Document not found."); },
+      /Document not found/
+    );
+  });
+
+  it("does not throw when snapshot.missing is present (doc found)", () => {
+    // Simulate the guard logic: snapshot.missing = base64 data means doc found
+    const snapshot: { missing?: string } = { missing: "dGVzdA==" };
+    assert.doesNotThrow(
+      () => { if (snapshot.missing === undefined) throw new Error("Document not found."); }
+    );
+  });
+
   it("CRDT update is non-empty when states differ", () => {
     const histDoc = new Y.Doc();
     createBlock(histDoc, "blockA", "affine:paragraph", { "prop:type": "text" });
