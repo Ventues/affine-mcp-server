@@ -686,7 +686,7 @@ describe("integration", () => {
     assert.equal(finalChildren[0], siblingId);
   });
 
-  it("delete_blocks removes multiple blocks in one transaction", async () => {
+  it("delete_block (batch) removes multiple blocks in one transaction", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Bulk Delete Test");
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
@@ -717,7 +717,7 @@ describe("integration", () => {
     assert.deepEqual(getNoteChildIds(blocks3), [aId, cId]);
   });
 
-  it("update_blocks updates multiple blocks in one transaction", async () => {
+  it("update_block (batch) updates multiple blocks in one transaction", async () => {
     const { ydoc, docId, noteId } = createEmptyDoc("Bulk Update Test");
     docsToCleanup.push(docId);
     const blocks = ydoc.getMap("blocks");
@@ -2211,7 +2211,7 @@ describe("Comment operations", () => {
     }
   });
 
-  it("write_docs_from_markdown rewrites multiple docs in one call", async () => {
+  it("write_doc_from_markdown (batch) rewrites multiple docs in one call", async () => {
     // Create 2 docs with initial content
     const doc1 = createEmptyDoc("Bulk Write Doc 1");
     const doc2 = createEmptyDoc("Bulk Write Doc 2");
@@ -2231,7 +2231,7 @@ describe("Comment operations", () => {
     await pushDoc(socket, doc1.docId, doc1.ydoc);
     await pushDoc(socket, doc2.docId, doc2.ydoc);
 
-    // Now bulk-rewrite both docs using the same CRDT logic as write_docs_from_markdown
+    // Now bulk-rewrite both docs using the same CRDT logic as write_doc_from_markdown (batch)
     // (replicate the handler logic directly since handlers are closures)
     const entries = [
       { docId: doc1.docId, markdown: "Hello from bulk write 1\n\nSecond paragraph 1" },
@@ -2296,6 +2296,6 @@ describe("Comment operations", () => {
       const secondText = getBlockText(readBack, childIds[1]);
       assert.ok(secondText.includes(`Second paragraph ${i + 1}`), `doc ${i + 1} second paragraph should match`);
     }
-    console.log("  write_docs_from_markdown: 2 docs rewritten in one socket session");
+    console.log("  write_doc_from_markdown (batch): 2 docs rewritten in one socket session");
   });
 });

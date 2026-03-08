@@ -2069,46 +2069,17 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     return { written: true, docId: entry.docId, blocksCreated: noteChildren.length };
   }
 
-  const writeDocFromMarkdownHandler = async (parsed: { workspaceId?: string; docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }) => {
-    const workspaceId = parsed.workspaceId || defaults.workspaceId;
-    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-
-    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-    try {
-      await joinWorkspace(socket, workspaceId);
-      const result = await writeOneDoc(socket, workspaceId, parsed);
-      if ((result as any).dryRun) return text(result);
-      return text(result);
-    } finally {
-      socket.disconnect();
-    }
-  };
-
-  server.registerTool(
-    "write_doc_from_markdown",
-    {
-      title: "Write Document from Markdown",
-      description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview. IMPORTANT: attachment blocks are represented as '📎 filename' lines in markdown — if you omit them from the markdown you pass in, they will be permanently dropped. Always include '📎 filename' lines for any attachments that should be preserved.",
-      inputSchema: {
-        workspaceId: WorkspaceId.optional(),
-        docId: DocId,
-        markdown: z.string().describe("Markdown content to write into the document body"),
-        dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
-        blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
-        blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
-        blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs. The contiguous range from first to last matched block is replaced."),
-      },
-    },
-    writeDocFromMarkdownHandler as any
-  );
-
-  // ── write_docs_from_markdown (bulk) ───────────────────────────────────
-  const writeDocsFromMarkdownHandler = async (parsed: {
+  // ── write_doc_from_markdown (single or batch) ──────────────────────
+  const writeDocFromMarkdownHandler = async (parsed: {
     workspaceId?: string;
-    docs: { docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }[];
+    docId?: string; markdown?: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[];
+    docs?: { docId: string; markdown: string; dryRun?: boolean; blockOffset?: number; blockLimit?: number; blockIds?: string[] }[];
   }) => {
+    const isBatch = Array.isArray(parsed.docs) && parsed.docs.length > 0;
+    const isSingle = typeof parsed.docId === 'string' && parsed.docId.length > 0;
+    if (isBatch && isSingle) throw new Error("Provide docId+markdown (single) or docs array (batch), not both.");
+    if (!isBatch && !isSingle) throw new Error("Provide docId+markdown (single) or docs array (batch).");
+
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
 
@@ -2117,8 +2088,16 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
     try {
       await joinWorkspace(socket, workspaceId);
+
+      if (isSingle) {
+        const result = await writeOneDoc(socket, workspaceId, parsed as any);
+        if ((result as any).dryRun) return text(result);
+        return text(result);
+      }
+
+      // Batch mode
       const results: object[] = [];
-      for (const entry of parsed.docs) {
+      for (const entry of parsed.docs!) {
         try {
           results.push(await writeOneDoc(socket, workspaceId, entry));
         } catch (err: any) {
@@ -2141,16 +2120,22 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
   });
 
   server.registerTool(
-    "write_docs_from_markdown",
+    "write_doc_from_markdown",
     {
-      title: "Write Multiple Documents from Markdown",
-      description: "Batch rewrite multiple documents in a single WebSocket connection. Accepts an array of {docId, markdown} pairs. Each entry supports the same options as write_doc_from_markdown (dryRun, blockOffset, blockLimit, blockIds). Much faster than calling write_doc_from_markdown multiple times. Per-doc errors are isolated — one failure does not abort the batch.",
+      title: "Write Document from Markdown",
+      description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview. IMPORTANT: attachment blocks are represented as '📎 filename' lines in markdown — if you omit them from the markdown you pass in, they will be permanently dropped. Always include '📎 filename' lines for any attachments that should be preserved. Accepts single doc (docId+markdown) or batch (docs array).",
       inputSchema: {
         workspaceId: WorkspaceId.optional(),
-        docs: z.array(writeDocEntrySchema).min(1).describe("Array of {docId, markdown, ...options} entries to write"),
+        docId: DocId.optional(),
+        markdown: z.string().optional().describe("Markdown content to write into the document body"),
+        dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
+        blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
+        blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
+        blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs. The contiguous range from first to last matched block is replaced."),
+        docs: z.array(writeDocEntrySchema).min(1).optional().describe("Array of {docId, markdown, ...options} entries for batch mode."),
       },
     },
-    writeDocsFromMarkdownHandler as any
+    writeDocFromMarkdownHandler as any
   );
 
   // ── update_doc_markdown (str_replace style partial update) ────────────
@@ -2343,137 +2328,8 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
   // ── update_block (edit block text/properties in-place) ────────────────
   const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
 
-  const updateBlockHandler = async (parsed: {
-    workspaceId?: string; docId: string; blockId: string;
-    text?: string; properties?: Record<string, any>;
-  }) => {
-    const workspaceId = parsed.workspaceId || defaults.workspaceId;
-    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-
-    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-    try {
-      await joinWorkspace(socket, workspaceId);
-      const doc = new Y.Doc();
-      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
-      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const block = findBlockById(blocks, parsed.blockId);
-      if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
-
-      const flavour = block.get("sys:flavour") as string;
-      if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot update structural block (${flavour}).`);
-
-      const prevSV = Y.encodeStateVector(doc);
-
-      // Update text in-place (preserves Y.Text identity for CRDT correctness)
-      if (parsed.text !== undefined) {
-        const yText = block.get("prop:text");
-        if (yText instanceof Y.Text) {
-          yText.delete(0, yText.length);
-          yText.insert(0, parsed.text);
-        } else {
-          block.set("prop:text", makeText(parsed.text));
-        }
-      }
-
-      // Update properties
-      if (parsed.properties) {
-        for (const [key, value] of Object.entries(parsed.properties)) {
-          const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
-          block.set(propKey, value);
-        }
-      }
-
-      const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-      await touchDocMeta(socket, workspaceId, parsed.docId);
-
-      return text({ updated: true, blockId: parsed.blockId, flavour });
-    } finally {
-      socket.disconnect();
-    }
-  };
-
-  const updateBlockMeta = {
-    title: "Update Block",
-    description: "Edit an existing block's text or properties in-place. Cannot update structural blocks (page, surface, note). For text updates, the Y.Text is modified in-place preserving CRDT identity.",
-    inputSchema: {
-      workspaceId: WorkspaceId.optional(),
-      docId: DocId,
-      blockId: z.string().min(1).describe("ID of the block to update"),
-      text: z.string().optional().describe("New plain text content for the block"),
-      properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
-    },
-  };
-  server.registerTool("update_block", updateBlockMeta, updateBlockHandler as any);
-
-  // ── update_blocks (bulk update) ───────────────────────────────────────
+  // ── update_block (single or batch) ──────────────────────────────────
   type UpdateBlockEntry = { blockId: string; text?: string; properties?: Record<string, any> };
-
-  const updateBlocksHandler = async (parsed: {
-    workspaceId?: string; docId: string; blocks: UpdateBlockEntry[];
-  }) => {
-    const workspaceId = parsed.workspaceId || defaults.workspaceId;
-    if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-    if (!parsed.blocks || parsed.blocks.length === 0) throw new Error("blocks array is required and must not be empty");
-
-    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-    try {
-      await joinWorkspace(socket, workspaceId);
-      const doc = new Y.Doc();
-      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-      if (!snapshot.missing) throw new Error(`Document '${parsed.docId}' not found.`);
-      Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const prevSV = Y.encodeStateVector(doc);
-      const updated: { blockId: string; flavour: string }[] = [];
-      const skipped: { blockId: string; reason: string }[] = [];
-
-      for (const entry of parsed.blocks) {
-        const block = findBlockById(blocks, entry.blockId);
-        if (!block) { skipped.push({ blockId: entry.blockId, reason: "not found" }); continue; }
-
-        const flavour = block.get("sys:flavour") as string;
-        if (STRUCTURAL_FLAVOURS.has(flavour)) { skipped.push({ blockId: entry.blockId, reason: `structural (${flavour})` }); continue; }
-
-        if (entry.text !== undefined) {
-          const yText = block.get("prop:text");
-          if (yText instanceof Y.Text) {
-            yText.delete(0, yText.length);
-            yText.insert(0, entry.text);
-          } else {
-            block.set("prop:text", makeText(entry.text));
-          }
-        }
-
-        if (entry.properties) {
-          for (const [key, value] of Object.entries(entry.properties)) {
-            const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
-            block.set(propKey, value);
-          }
-        }
-
-        updated.push({ blockId: entry.blockId, flavour });
-      }
-
-      const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-      await touchDocMeta(socket, workspaceId, parsed.docId);
-
-      return text({ updated: updated.length, blocks: updated, skipped: skipped.length > 0 ? skipped : undefined });
-    } finally {
-      socket.disconnect();
-    }
-  };
 
   const updateBlockEntrySchema = z.object({
     blockId: z.string().min(1).describe("ID of the block to update"),
@@ -2481,21 +2337,16 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
   });
 
-  const updateBlocksMeta = {
-    title: "Update Multiple Blocks",
-    description: "Update multiple blocks in a single transaction. Much faster than calling update_block multiple times. Skips structural blocks (page, surface, note) and missing blocks.",
-    inputSchema: {
-      workspaceId: WorkspaceId.optional(),
-      docId: DocId,
-      blocks: z.array(updateBlockEntrySchema).min(1).describe("Array of block updates. Each entry requires blockId and optionally text and/or properties."),
-    },
-  };
-  server.registerTool("update_blocks", updateBlocksMeta, updateBlocksHandler as any);
-
-  // ── delete_block (remove block + descendants) ─────────────────────────
-  const deleteBlockHandler = async (parsed: {
-    workspaceId?: string; docId: string; blockId: string;
+  const updateBlockHandler = async (parsed: {
+    workspaceId?: string; docId: string;
+    blockId?: string; text?: string; properties?: Record<string, any>;
+    blocks?: UpdateBlockEntry[];
   }) => {
+    const isBatch = Array.isArray(parsed.blocks) && parsed.blocks.length > 0;
+    const isSingle = typeof parsed.blockId === 'string' && parsed.blockId.length > 0;
+    if (isBatch && isSingle) throw new Error("Provide blockId (single) or blocks array (batch), not both.");
+    if (!isBatch && !isSingle) throw new Error("Provide blockId (single) or blocks array (batch).");
+
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
 
@@ -2510,52 +2361,89 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
 
       const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const block = findBlockById(blocks, parsed.blockId);
-      if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
+      const prevSV = Y.encodeStateVector(doc);
 
-      const flavour = block.get("sys:flavour") as string;
-      if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot delete structural block (${flavour}).`);
+      if (isSingle) {
+        // Single-block mode
+        const block = findBlockById(blocks, parsed.blockId!);
+        if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
+        const flavour = block.get("sys:flavour") as string;
+        if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot update structural block (${flavour}).`);
 
-      // Remove from parent's sys:children
-      const parentId = block.get("sys:parent") as string;
-      if (parentId) {
-        const parent = findBlockById(blocks, parentId);
-        if (parent) {
-          const children = ensureChildrenArray(parent);
-          const idx = indexOfChild(children, parsed.blockId);
-          if (idx >= 0) children.delete(idx, 1);
+        if (parsed.text !== undefined) {
+          const yText = block.get("prop:text");
+          if (yText instanceof Y.Text) { yText.delete(0, yText.length); yText.insert(0, parsed.text); }
+          else { block.set("prop:text", makeText(parsed.text)); }
         }
+        if (parsed.properties) {
+          for (const [key, value] of Object.entries(parsed.properties)) {
+            block.set(key.startsWith("prop:") ? key : `prop:${key}`, value);
+          }
+        }
+
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+          .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+        await touchDocMeta(socket, workspaceId, parsed.docId);
+        return text({ updated: true, blockId: parsed.blockId, flavour });
       }
 
-      const prevSV = Y.encodeStateVector(doc);
-      removeBlockTree(blocks, parsed.blockId);
+      // Batch mode
+      const updated: { blockId: string; flavour: string }[] = [];
+      const skipped: { blockId: string; reason: string }[] = [];
+
+      for (const entry of parsed.blocks!) {
+        const block = findBlockById(blocks, entry.blockId);
+        if (!block) { skipped.push({ blockId: entry.blockId, reason: "not found" }); continue; }
+        const flavour = block.get("sys:flavour") as string;
+        if (STRUCTURAL_FLAVOURS.has(flavour)) { skipped.push({ blockId: entry.blockId, reason: `structural (${flavour})` }); continue; }
+
+        if (entry.text !== undefined) {
+          const yText = block.get("prop:text");
+          if (yText instanceof Y.Text) { yText.delete(0, yText.length); yText.insert(0, entry.text); }
+          else { block.set("prop:text", makeText(entry.text)); }
+        }
+        if (entry.properties) {
+          for (const [key, value] of Object.entries(entry.properties)) {
+            block.set(key.startsWith("prop:") ? key : `prop:${key}`, value);
+          }
+        }
+        updated.push({ blockId: entry.blockId, flavour });
+      }
 
       const delta = Y.encodeStateAsUpdate(doc, prevSV);
       await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
         .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
       await touchDocMeta(socket, workspaceId, parsed.docId);
-
-      return text({ deleted: true, blockId: parsed.blockId, flavour });
+      return text({ updated: updated.length, blocks: updated, skipped: skipped.length > 0 ? skipped : undefined });
     } finally {
       socket.disconnect();
     }
   };
 
-  const deleteBlockMeta = {
-    title: "Delete Block",
-    description: "Delete a block and all its descendants from a document. Cannot delete structural blocks (page, surface, note).",
+  const updateBlockMeta = {
+    title: "Update Block",
+    description: "Edit an existing block's text or properties in-place. Cannot update structural blocks (page, surface, note). For text updates, the Y.Text is modified in-place preserving CRDT identity. Accepts single block (blockId) or batch (blocks array).",
     inputSchema: {
       workspaceId: WorkspaceId.optional(),
       docId: DocId,
-      blockId: z.string().min(1).describe("ID of the block to delete"),
+      blockId: z.string().min(1).optional().describe("ID of the block to update (single mode)"),
+      text: z.string().optional().describe("New plain text content for the block"),
+      properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
+      blocks: z.array(updateBlockEntrySchema).min(1).optional().describe("Array of block updates for batch mode. Each entry requires blockId and optionally text and/or properties."),
     },
   };
-  server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler as any);
+  server.registerTool("update_block", updateBlockMeta, updateBlockHandler as any);
 
-  // ── delete_blocks (bulk delete) ───────────────────────────────────────
-  const deleteBlocksHandler = async (parsed: {
-    workspaceId?: string; docId: string; blockIds: string[];
+  // ── delete_block (single or batch) ──────────────────────────────────
+  const deleteBlockHandler = async (parsed: {
+    workspaceId?: string; docId: string; blockId?: string; blockIds?: string[];
   }) => {
+    const isBatch = Array.isArray(parsed.blockIds) && parsed.blockIds.length > 0;
+    const isSingle = typeof parsed.blockId === 'string' && parsed.blockId.length > 0;
+    if (isBatch && isSingle) throw new Error("Provide blockId (single) or blockIds array (batch), not both.");
+    if (!isBatch && !isSingle) throw new Error("Provide blockId (single) or blockIds array (batch).");
+
     const workspaceId = parsed.workspaceId || defaults.workspaceId;
     if (!workspaceId) throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
 
@@ -2570,17 +2458,41 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
 
       const blocks = doc.getMap("blocks") as Y.Map<any>;
-      const deleted: string[] = [];
       const prevSV = Y.encodeStateVector(doc);
 
-      for (const blockId of parsed.blockIds) {
-        const block = findBlockById(blocks, blockId);
-        if (!block) continue; // skip missing blocks
-
+      if (isSingle) {
+        // Single-block mode
+        const block = findBlockById(blocks, parsed.blockId!);
+        if (!block) throw new Error(`Block '${parsed.blockId}' not found.`);
         const flavour = block.get("sys:flavour") as string;
-        if (STRUCTURAL_FLAVOURS.has(flavour)) continue; // skip structural blocks
+        if (STRUCTURAL_FLAVOURS.has(flavour)) throw new Error(`Cannot delete structural block (${flavour}).`);
 
-        // Remove from parent's sys:children
+        const parentId = block.get("sys:parent") as string;
+        if (parentId) {
+          const parent = findBlockById(blocks, parentId);
+          if (parent) {
+            const children = ensureChildrenArray(parent);
+            const idx = indexOfChild(children, parsed.blockId!);
+            if (idx >= 0) children.delete(idx, 1);
+          }
+        }
+        removeBlockTree(blocks, parsed.blockId!);
+
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+          .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+        await touchDocMeta(socket, workspaceId, parsed.docId);
+        return text({ deleted: true, blockId: parsed.blockId, flavour });
+      }
+
+      // Batch mode
+      const deleted: string[] = [];
+      for (const blockId of parsed.blockIds!) {
+        const block = findBlockById(blocks, blockId);
+        if (!block) continue;
+        const flavour = block.get("sys:flavour") as string;
+        if (STRUCTURAL_FLAVOURS.has(flavour)) continue;
+
         const parentId = block.get("sys:parent") as string;
         if (parentId) {
           const parent = findBlockById(blocks, parentId);
@@ -2590,7 +2502,6 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             if (idx >= 0) children.delete(idx, 1);
           }
         }
-
         removeBlockTree(blocks, blockId);
         deleted.push(blockId);
       }
@@ -2599,42 +2510,23 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
       await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
         .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
       await touchDocMeta(socket, workspaceId, parsed.docId);
-
       return text({ deleted: deleted.length, blockIds: deleted });
     } finally {
       socket.disconnect();
     }
   };
 
-  const deleteBlocksMeta = {
-    title: "Delete Multiple Blocks",
-    description: "Delete multiple blocks in a single transaction. Skips structural blocks (page, surface, note) and missing blocks.",
+  const deleteBlockMeta = {
+    title: "Delete Block",
+    description: "Delete a block and all its descendants from a document. Cannot delete structural blocks (page, surface, note). Accepts single block (blockId) or batch (blockIds array). Batch mode skips missing/structural blocks.",
     inputSchema: {
       workspaceId: WorkspaceId.optional(),
       docId: DocId,
-      blockIds: z.array(z.string().min(1)).describe("Array of block IDs to delete"),
+      blockId: z.string().min(1).optional().describe("ID of the block to delete (single mode)"),
+      blockIds: z.array(z.string().min(1)).optional().describe("Array of block IDs to delete (batch mode)"),
     },
   };
-  server.registerTool("delete_blocks", deleteBlocksMeta, deleteBlocksHandler as any);
-
-  // ── delete_blocks_csv (bulk delete with CSV input) ───────────────────
-  const deleteBlocksCsvHandler = async (parsed: {
-    workspaceId?: string; docId: string; blockIds: string;
-  }) => {
-    const ids = parsed.blockIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
-    return deleteBlocksHandler({ ...parsed, blockIds: ids });
-  };
-
-  const deleteBlocksCsvMeta = {
-    title: "Delete Multiple Blocks (CSV)",
-    description: "Delete multiple blocks using comma-separated block IDs. Alternative to delete_blocks for clients that don't support JSON arrays.",
-    inputSchema: {
-      workspaceId: WorkspaceId.optional(),
-      docId: DocId,
-      blockIds: z.string().min(1).describe("Comma-separated block IDs (e.g., 'id1,id2,id3')"),
-    },
-  };
-  server.registerTool("delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler as any);
+  server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler as any);
 
   // ── move_block (reorder / reparent a block) ───────────────────────────
   const moveBlockHandler = async (parsed: {
@@ -3123,177 +3015,8 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     createDocHandler as any
   );
 
-  // APPEND PARAGRAPH
-  const appendParagraphHandler = async (parsed: { workspaceId?: string; docId: string; text: string }) => {
-    const result = await appendBlockInternal({
-      workspaceId: parsed.workspaceId,
-      docId: parsed.docId,
-      type: "paragraph",
-      text: parsed.text,
-    });
-    return text({ appended: result.appended, paragraphId: result.blockId });
-  };
-  server.registerTool(
-    'append_paragraph',
-    {
-      title: 'Append Paragraph',
-      description: 'Append a text paragraph block to a document',
-      inputSchema: {
-        workspaceId: z.string().optional(),
-        docId: z.string(),
-        text: z.string(),
-      },
-    },
-    appendParagraphHandler as any
-  );
-
-  const appendBlockHandler = async (parsed: {
-    workspaceId?: string;
-    docId: string;
-    type: string;
-    text?: string;
-    url?: string;
-    pageId?: string;
-    iframeUrl?: string;
-    html?: string;
-    design?: string;
-    reference?: string;
-    refFlavour?: string;
-    width?: number;
-    height?: number;
-    background?: string;
-    sourceId?: string;
-    name?: string;
-    mimeType?: string;
-    size?: number;
-    embed?: boolean;
-    rows?: number;
-    columns?: number;
-    latex?: string;
-    checked?: boolean;
-    language?: string;
-    caption?: string;
-    level?: number;
-    style?: AppendBlockListStyle;
-    bookmarkStyle?: AppendBlockBookmarkStyle;
-    strict?: boolean;
-    placement?: AppendPlacement;
-  }) => {
-    const result = await appendBlockInternal(parsed);
-    return text({
-      appended: result.appended,
-      blockId: result.blockId,
-      flavour: result.flavour,
-      type: result.blockType || null,
-      normalizedType: result.normalizedType,
-      legacyType: result.legacyType,
-    });
-  };
-  server.registerTool(
-    "append_block",
-    {
-      title: "Append Block",
-      description: "Append document blocks with canonical types and legacy aliases (supports placement + strict validation).",
-      inputSchema: {
-        workspaceId: WorkspaceId.optional(),
-        docId: DocId,
-        type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
-        text: z.string().optional().describe("Block content text"),
-        url: z.string().optional().describe("URL for bookmark/embeds"),
-        pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
-        iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
-        html: z.string().optional().describe("Raw html for embed_html"),
-        design: z.string().optional().describe("Design payload for embed_html"),
-        reference: z.string().optional().describe("Target id for surface_ref"),
-        refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
-        width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note"),
-        height: z.number().int().min(1).max(10000).optional().describe("Height for frame/edgeless_text/note"),
-        background: z.string().optional().describe("Background for frame/note"),
-        sourceId: z.string().optional().describe("Blob source id for image/attachment"),
-        name: z.string().optional().describe("Attachment file name"),
-        mimeType: z.string().optional().describe("Attachment mime type"),
-        size: z.number().optional().describe("Attachment/image file size in bytes"),
-        embed: z.boolean().optional().describe("Attachment embed mode"),
-        rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
-        columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
-        latex: z.string().optional().describe("Latex expression"),
-        level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
-        style: AppendBlockListStyle.optional().describe("List style for type=list"),
-        bookmarkStyle: AppendBlockBookmarkStyle.optional().describe("Bookmark card style"),
-        checked: z.boolean().optional().describe("Todo state when type is todo"),
-        language: z.string().optional().describe("Code language when type is code"),
-        caption: z.string().optional().describe("Code caption when type is code"),
-        strict: z.boolean().optional().describe("Strict validation mode (default true)"),
-        placement: z
-          .object({
-            parentId: z.string().optional(),
-            afterBlockId: z.string().optional(),
-            beforeBlockId: z.string().optional(),
-            index: z.number().int().min(0).optional(),
-          })
-          .optional()
-          .describe("Optional insertion target/position"),
-      },
-    },
-    appendBlockHandler as any
-  );
-
-  // APPEND BLOCKS (batch – multiple blocks in one transaction)
+  // ── append_block (single or batch) ─────────────────────────────────
   type AppendBlockEntry = Omit<AppendBlockInput, 'workspaceId' | 'docId'>;
-
-  const appendBlocksHandler = async (parsed: {
-    workspaceId?: string;
-    docId: string;
-    blocks: AppendBlockEntry[];
-  }) => {
-    const workspaceId = parsed.workspaceId || defaults.workspaceId;
-    if (!workspaceId) throw new Error("workspaceId is required");
-    if (!parsed.blocks || parsed.blocks.length === 0) throw new Error("blocks array is required and must not be empty");
-
-    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-    try {
-      await joinWorkspace(socket, workspaceId);
-      const doc = new Y.Doc();
-      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-      if (snapshot.missing) {
-        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-      }
-      const prevSV = Y.encodeStateVector(doc);
-      const blocks = doc.getMap("blocks") as Y.Map<any>;
-
-      const results: { blockId: string; flavour: string; type: string | null; normalizedType: string; legacyType: string | null }[] = [];
-
-      for (const entry of parsed.blocks) {
-        const normalized = normalizeAppendBlockInput({ ...entry, workspaceId, docId: parsed.docId });
-        const context = resolveInsertContext(blocks, normalized);
-        const { blockId, block, flavour, blockType } = createBlock(context.parentId, normalized);
-        blocks.set(blockId, block);
-        if (context.insertIndex >= context.children.length) {
-          context.children.push([blockId]);
-        } else {
-          context.children.insert(context.insertIndex, [blockId]);
-        }
-        results.push({
-          blockId,
-          flavour,
-          type: blockType || null,
-          normalizedType: normalized.type,
-          legacyType: normalized.legacyType || null,
-        });
-      }
-
-      const delta = Y.encodeStateAsUpdate(doc, prevSV);
-      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-      await touchDocMeta(socket, workspaceId, parsed.docId);
-
-      return text({ appended: results.length, blocks: results });
-    } finally {
-      socket.disconnect();
-    }
-  };
 
   const appendBlockEntrySchema = z.object({
     type: z.string().min(1).describe("Block type (same types as append_block)"),
@@ -3331,16 +3054,178 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     }).optional(),
   });
 
-  const appendBlocksMeta = {
-    title: "Append Multiple Blocks",
-    description: "Append multiple blocks to a document in a single transaction. Much faster than calling append_block multiple times. Each block entry accepts the same properties as append_block (type, text, url, etc). Blocks are appended in order.",
-    inputSchema: {
-      workspaceId: WorkspaceId.optional(),
-      docId: DocId,
-      blocks: z.array(appendBlockEntrySchema).min(1).describe("Array of block definitions to append. Each entry has the same shape as append_block params (minus workspaceId/docId)."),
-    },
+  const appendBlockHandler = async (parsed: {
+    workspaceId?: string;
+    docId: string;
+    type?: string;
+    text?: string;
+    url?: string;
+    pageId?: string;
+    iframeUrl?: string;
+    html?: string;
+    design?: string;
+    reference?: string;
+    refFlavour?: string;
+    width?: number;
+    height?: number;
+    background?: string;
+    sourceId?: string;
+    name?: string;
+    mimeType?: string;
+    size?: number;
+    embed?: boolean;
+    rows?: number;
+    columns?: number;
+    latex?: string;
+    checked?: boolean;
+    language?: string;
+    caption?: string;
+    level?: number;
+    style?: AppendBlockListStyle;
+    bookmarkStyle?: AppendBlockBookmarkStyle;
+    strict?: boolean;
+    placement?: AppendPlacement;
+    blocks?: AppendBlockEntry[];
+  }) => {
+    const isBatch = Array.isArray(parsed.blocks) && parsed.blocks.length > 0;
+    const isSingle = typeof parsed.type === 'string' && parsed.type.length > 0;
+    if (isBatch && isSingle) throw new Error("Provide type (single) or blocks array (batch), not both.");
+    if (!isBatch && !isSingle) throw new Error("Provide type (single) or blocks array (batch).");
+
+    if (isSingle) {
+      const result = await appendBlockInternal(parsed as AppendBlockInput);
+      return text({
+        appended: result.appended,
+        blockId: result.blockId,
+        flavour: result.flavour,
+        type: result.blockType || null,
+        normalizedType: result.normalizedType,
+        legacyType: result.legacyType,
+      });
+    }
+
+    // Batch mode
+    const workspaceId = parsed.workspaceId || defaults.workspaceId;
+    if (!workspaceId) throw new Error("workspaceId is required");
+
+    const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+      await joinWorkspace(socket, workspaceId);
+      const doc = new Y.Doc();
+      const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
+      if (snapshot.missing) {
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+      }
+      const prevSV = Y.encodeStateVector(doc);
+      const blocks = doc.getMap("blocks") as Y.Map<any>;
+
+      const results: { blockId: string; flavour: string; type: string | null; normalizedType: string; legacyType: string | null }[] = [];
+
+      for (const entry of parsed.blocks!) {
+        const normalized = normalizeAppendBlockInput({ ...entry, workspaceId, docId: parsed.docId });
+        const context = resolveInsertContext(blocks, normalized);
+        const { blockId, block, flavour, blockType } = createBlock(context.parentId, normalized);
+        blocks.set(blockId, block);
+        if (context.insertIndex >= context.children.length) {
+          context.children.push([blockId]);
+        } else {
+          context.children.insert(context.insertIndex, [blockId]);
+        }
+        results.push({
+          blockId,
+          flavour,
+          type: blockType || null,
+          normalizedType: normalized.type,
+          legacyType: normalized.legacyType || null,
+        });
+      }
+
+      const delta = Y.encodeStateAsUpdate(doc, prevSV);
+      await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+        .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+      await touchDocMeta(socket, workspaceId, parsed.docId);
+
+      return text({ appended: results.length, blocks: results });
+    } finally {
+      socket.disconnect();
+    }
   };
-  server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler as any);
+
+  server.registerTool(
+    "append_block",
+    {
+      title: "Append Block",
+      description: "Append document blocks with canonical types and legacy aliases (supports placement + strict validation). Accepts single block (type param) or batch (blocks array).",
+      inputSchema: {
+        workspaceId: WorkspaceId.optional(),
+        docId: DocId,
+        type: z.string().min(1).optional().describe("Block type (single mode). Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
+        text: z.string().optional().describe("Block content text"),
+        url: z.string().optional().describe("URL for bookmark/embeds"),
+        pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
+        iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
+        html: z.string().optional().describe("Raw html for embed_html"),
+        design: z.string().optional().describe("Design payload for embed_html"),
+        reference: z.string().optional().describe("Target id for surface_ref"),
+        refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
+        width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note"),
+        height: z.number().int().min(1).max(10000).optional().describe("Height for frame/edgeless_text/note"),
+        background: z.string().optional().describe("Background for frame/note"),
+        sourceId: z.string().optional().describe("Blob source id for image/attachment"),
+        name: z.string().optional().describe("Attachment file name"),
+        mimeType: z.string().optional().describe("Attachment mime type"),
+        size: z.number().optional().describe("Attachment/image file size in bytes"),
+        embed: z.boolean().optional().describe("Attachment embed mode"),
+        rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
+        columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
+        latex: z.string().optional().describe("Latex expression"),
+        level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
+        style: AppendBlockListStyle.optional().describe("List style for type=list"),
+        bookmarkStyle: AppendBlockBookmarkStyle.optional().describe("Bookmark card style"),
+        checked: z.boolean().optional().describe("Todo state when type is todo"),
+        language: z.string().optional().describe("Code language when type is code"),
+        caption: z.string().optional().describe("Code caption when type is code"),
+        strict: z.boolean().optional().describe("Strict validation mode (default true)"),
+        placement: z
+          .object({
+            parentId: z.string().optional(),
+            afterBlockId: z.string().optional(),
+            beforeBlockId: z.string().optional(),
+            index: z.number().int().min(0).optional(),
+          })
+          .optional()
+          .describe("Optional insertion target/position"),
+        blocks: z.array(appendBlockEntrySchema).min(1).optional().describe("Array of block definitions for batch mode. Each entry has the same shape as single-mode params (minus workspaceId/docId)."),
+      },
+    },
+    appendBlockHandler as any
+  );
+
+  // APPEND PARAGRAPH — thin alias for append_block(type='paragraph')
+  const appendParagraphHandler = async (parsed: { workspaceId?: string; docId: string; text: string }) => {
+    const result = await appendBlockInternal({
+      workspaceId: parsed.workspaceId,
+      docId: parsed.docId,
+      type: "paragraph",
+      text: parsed.text,
+    });
+    return text({ appended: result.appended, paragraphId: result.blockId });
+  };
+  server.registerTool(
+    'append_paragraph',
+    {
+      title: 'Append Paragraph',
+      description: 'Append a text paragraph block to a document',
+      inputSchema: {
+        workspaceId: z.string().optional(),
+        docId: z.string(),
+        text: z.string(),
+      },
+    },
+    appendParagraphHandler as any
+  );
 
   // DELETE DOC (single or batch) — moves to trash (soft delete)
   const deleteDocHandler = async (parsed: { workspaceId?: string; docId?: string; docIds?: string[] }) => {

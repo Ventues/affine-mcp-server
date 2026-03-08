@@ -16,6 +16,8 @@ import { loginWithPassword } from "./auth.js";
 import { registerAuthTools } from "./tools/auth.js";
 import { registerOrganizeTools } from "./tools/organize.js";
 import { registerCanvasTools } from "./tools/canvas.js";
+import { registerKanbanTools } from "./tools/kanban.js";
+import { registerMoveDocsTools } from "./tools/moveDocs.js";
 import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const pkg = require("../package.json");
@@ -77,6 +79,8 @@ async function buildServer() {
     registerAuthTools(server, gql, config.baseUrl);
     registerOrganizeTools(server, gql, { workspaceId: config.defaultWorkspaceId });
     registerCanvasTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+    registerKanbanTools(server, gql, { workspaceId: config.defaultWorkspaceId });
+    registerMoveDocsTools(server, gql, { workspaceId: config.defaultWorkspaceId });
     return server;
 }
 async function start() {

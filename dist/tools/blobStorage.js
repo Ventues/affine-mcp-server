@@ -79,6 +79,24 @@ export function registerBlobTools(server, gql) {
             contentType: z.string().optional().describe("MIME type")
         }
     }, uploadBlobHandler);
+    // READ BLOB
+    const readBlobHandler = async ({ workspaceId, key }) => {
+        const baseUrl = gql.endpoint.replace(/\/graphql$/, '');
+        const url = `${baseUrl}/api/workspaces/${workspaceId}/blobs/${key}`;
+        const res = await fetch(url, { headers: gql.getAuthHeaders() });
+        if (!res.ok)
+            throw new Error(`Blob fetch failed: ${res.status}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        return text({ key, contentType: res.headers.get('content-type') || 'application/octet-stream', content: buf.toString('base64') });
+    };
+    server.registerTool("read_blob", {
+        title: "Read Blob",
+        description: "Read a blob/file from workspace storage. Returns base64 content.",
+        inputSchema: {
+            workspaceId: z.string().describe("Workspace ID"),
+            key: z.string().describe("Blob key/sourceId"),
+        }
+    }, readBlobHandler);
     // DELETE BLOB
     const deleteBlobHandler = async ({ workspaceId, key, permanently = false }) => {
         try {
@@ -131,4 +149,15 @@ export function registerBlobTools(server, gql) {
             workspaceId: z.string().describe("Workspace ID")
         }
     }, cleanupBlobsHandler);
+}
+export function createReadBlobHandler(gql, fetchFn = fetch) {
+    return async ({ workspaceId, key }) => {
+        const baseUrl = gql.endpoint.replace(/\/graphql$/, "");
+        const url = `${baseUrl}/api/workspaces/${workspaceId}/blobs/${key}`;
+        const res = await fetchFn(url, { headers: gql.getAuthHeaders() });
+        if (!res.ok)
+            throw new Error(`Blob fetch failed: ${res.status}`);
+        const buf = Buffer.from(await res.arrayBuffer());
+        return text({ key, contentType: res.headers.get("content-type") || "application/octet-stream", content: buf.toString("base64") });
+    };
 }

@@ -1027,6 +1027,46 @@ export function registerDocTools(server, gql, defaults) {
         }
         blocks.delete(blockId);
     }
+    /** Collect attachment metadata from blocks about to be removed, keyed by name */
+    function collectAttachmentMeta(blocks, blockIds) {
+        const meta = new Map();
+        for (const id of blockIds) {
+            const b = blocks.get(id);
+            if (!(b instanceof Y.Map))
+                continue;
+            if (b.get("sys:flavour") !== "affine:attachment")
+                continue;
+            const name = b.get("prop:name");
+            if (name)
+                meta.set(name, {
+                    sourceId: b.get("prop:sourceId") || "",
+                    size: b.get("prop:size") || 0,
+                    type: b.get("prop:type") || "application/octet-stream",
+                    embed: b.get("prop:embed") || false,
+                });
+        }
+        return meta;
+    }
+    /** Restore attachment metadata on newly created blocks that match by name */
+    function restoreAttachmentMeta(blocks, newBlockIds, meta) {
+        if (meta.size === 0)
+            return;
+        for (const id of newBlockIds) {
+            const b = blocks.get(id);
+            if (!(b instanceof Y.Map))
+                continue;
+            if (b.get("sys:flavour") !== "affine:attachment")
+                continue;
+            const name = b.get("prop:name");
+            const existing = name ? meta.get(name) : undefined;
+            if (existing) {
+                b.set("prop:sourceId", existing.sourceId);
+                b.set("prop:size", existing.size);
+                b.set("prop:type", existing.type);
+                b.set("prop:embed", existing.embed);
+            }
+        }
+    }
     async function appendBlockInternal(parsed) {
         const normalized = normalizeAppendBlockInput(parsed);
         const workspaceId = normalized.workspaceId || defaults.workspaceId;
@@ -1784,7 +1824,97 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             i++;
         }
     }
+    /** Inner per-doc logic shared by write_doc_from_markdown and write_docs_from_markdown */
+    async function writeOneDoc(socket, workspaceId, entry) {
+        const snapshot = await loadDoc(socket, workspaceId, entry.docId);
+        if (!snapshot.missing)
+            throw new Error(`Document '${entry.docId}' not found.`);
+        const doc = new Y.Doc();
+        Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
+        const blocks = doc.getMap("blocks");
+        const noteId = findBlockIdByFlavour(blocks, "affine:note");
+        if (!noteId)
+            throw new Error("Document has no note block.");
+        if (entry.dryRun) {
+            const noteBlock = blocks.get(noteId);
+            const pageId = findBlockIdByFlavour(blocks, "affine:page");
+            let title = "";
+            if (pageId) {
+                const pageBlock = blocks.get(pageId);
+                if (pageBlock)
+                    title = asText(pageBlock.get("prop:title"));
+            }
+            const { markdown: currentMd } = blocksToMarkdownWithMap(blocks, noteBlock, title);
+            return { docId: entry.docId, dryRun: true, currentMarkdown: currentMd, newMarkdown: entry.markdown };
+        }
+        const prevSV = Y.encodeStateVector(doc);
+        const noteBlock = blocks.get(noteId);
+        const noteChildren = ensureChildrenArray(noteBlock);
+        const existingChildIds = childIdsFrom(noteChildren);
+        const hasBlockFilter = (entry.blockIds && entry.blockIds.length > 0) || entry.blockOffset !== undefined || entry.blockLimit !== undefined;
+        let replaceStart = 0;
+        let replaceEnd = existingChildIds.length;
+        if (entry.blockIds && entry.blockIds.length > 0) {
+            const idSet = new Set(entry.blockIds);
+            const indices = existingChildIds.map((id, i) => idSet.has(id) ? i : -1).filter(i => i >= 0);
+            if (indices.length > 0) {
+                replaceStart = indices[0];
+                replaceEnd = indices[indices.length - 1] + 1;
+            }
+        }
+        else if (hasBlockFilter) {
+            replaceStart = entry.blockOffset ?? 0;
+            replaceEnd = Math.min(replaceStart + (entry.blockLimit ?? existingChildIds.length), existingChildIds.length);
+        }
+        const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
+        const attachMeta = collectAttachmentMeta(blocks, idsToRemove.length > 0 ? idsToRemove : existingChildIds);
+        if (idsToRemove.length > 0) {
+            noteChildren.delete(replaceStart, idsToRemove.length);
+            for (const cid of idsToRemove)
+                removeBlockTree(blocks, cid);
+        }
+        else if (!hasBlockFilter) {
+            if (noteChildren.length > 0)
+                noteChildren.delete(0, noteChildren.length);
+            for (const cid of existingChildIds)
+                removeBlockTree(blocks, cid);
+        }
+        let md = entry.markdown;
+        if (!hasBlockFilter) {
+            const pageId = findBlockIdByFlavour(blocks, "affine:page");
+            if (pageId) {
+                const pageBlock = blocks.get(pageId);
+                const docTitle = asText(pageBlock?.get("prop:title"));
+                if (docTitle) {
+                    const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
+                    md = md.replace(titlePattern, "");
+                }
+            }
+        }
+        const tempKey = `__temp_${Date.now()}`;
+        const tempChildren = new Y.Array();
+        doc.getMap("__temp").set(tempKey, tempChildren);
+        const mdTokens = mdParser.parse(escapePipes(md), {});
+        markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
+        const newIds = tempChildren.toArray();
+        doc.getMap("__temp").delete(tempKey);
+        restoreAttachmentMeta(blocks, newIds, attachMeta);
+        if (newIds.length > 0)
+            noteChildren.insert(replaceStart, newIds);
+        const delta = Y.encodeStateAsUpdate(doc, prevSV);
+        await pushDocUpdate(socket, workspaceId, entry.docId, Buffer.from(delta).toString("base64"))
+            .catch(err => { console.error(`pushDocUpdate failed for doc ${entry.docId}:`, err.message); throw err; });
+        await touchDocMeta(socket, workspaceId, entry.docId);
+        return { written: true, docId: entry.docId, blocksCreated: noteChildren.length };
+    }
+    // ── write_doc_from_markdown (single or batch) ──────────────────────
     const writeDocFromMarkdownHandler = async (parsed) => {
+        const isBatch = Array.isArray(parsed.docs) && parsed.docs.length > 0;
+        const isSingle = typeof parsed.docId === 'string' && parsed.docId.length > 0;
+        if (isBatch && isSingle)
+            throw new Error("Provide docId+markdown (single) or docs array (batch), not both.");
+        if (!isBatch && !isSingle)
+            throw new Error("Provide docId+markdown (single) or docs array (batch).");
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -1793,106 +1923,48 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
         const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
         try {
             await joinWorkspace(socket, workspaceId);
-            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-            if (!snapshot.missing)
-                throw new Error(`Document '${parsed.docId}' not found.`);
-            const doc = new Y.Doc();
-            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-            const blocks = doc.getMap("blocks");
-            const noteId = findBlockIdByFlavour(blocks, "affine:note");
-            if (!noteId)
-                throw new Error("Document has no note block.");
-            // Read current markdown for dry run / diff
-            if (parsed.dryRun) {
-                const noteBlock = blocks.get(noteId);
-                const pageId = findBlockIdByFlavour(blocks, "affine:page");
-                let title = "";
-                if (pageId) {
-                    const pageBlock = blocks.get(pageId);
-                    if (pageBlock)
-                        title = asText(pageBlock.get("prop:title"));
-                }
-                const { markdown: currentMd } = blocksToMarkdownWithMap(blocks, noteBlock, title);
-                return text({ dryRun: true, currentMarkdown: currentMd, newMarkdown: parsed.markdown });
+            if (isSingle) {
+                const result = await writeOneDoc(socket, workspaceId, parsed);
+                if (result.dryRun)
+                    return text(result);
+                return text(result);
             }
-            const prevSV = Y.encodeStateVector(doc);
-            const noteBlock = blocks.get(noteId);
-            const noteChildren = ensureChildrenArray(noteBlock);
-            const existingChildIds = childIdsFrom(noteChildren);
-            // Determine which blocks to replace
-            const hasBlockFilter = (parsed.blockIds && parsed.blockIds.length > 0) || parsed.blockOffset !== undefined || parsed.blockLimit !== undefined;
-            let replaceStart = 0;
-            let replaceEnd = existingChildIds.length;
-            if (parsed.blockIds && parsed.blockIds.length > 0) {
-                const idSet = new Set(parsed.blockIds);
-                const indices = existingChildIds.map((id, i) => idSet.has(id) ? i : -1).filter(i => i >= 0);
-                if (indices.length > 0) {
-                    replaceStart = indices[0];
-                    replaceEnd = indices[indices.length - 1] + 1;
+            // Batch mode
+            const results = [];
+            for (const entry of parsed.docs) {
+                try {
+                    results.push(await writeOneDoc(socket, workspaceId, entry));
+                }
+                catch (err) {
+                    results.push({ docId: entry.docId, error: err.message });
                 }
             }
-            else if (hasBlockFilter) {
-                replaceStart = parsed.blockOffset ?? 0;
-                replaceEnd = Math.min(replaceStart + (parsed.blockLimit ?? existingChildIds.length), existingChildIds.length);
-            }
-            // Remove the targeted blocks
-            const idsToRemove = existingChildIds.slice(replaceStart, replaceEnd);
-            if (idsToRemove.length > 0) {
-                noteChildren.delete(replaceStart, idsToRemove.length);
-                for (const cid of idsToRemove)
-                    removeBlockTree(blocks, cid);
-            }
-            else if (!hasBlockFilter) {
-                // Full replace — clear everything
-                if (noteChildren.length > 0)
-                    noteChildren.delete(0, noteChildren.length);
-                for (const cid of existingChildIds)
-                    removeBlockTree(blocks, cid);
-            }
-            // Parse markdown and create new blocks into a temp array, then splice in
-            let md = parsed.markdown;
-            if (!hasBlockFilter) {
-                const pageId = findBlockIdByFlavour(blocks, "affine:page");
-                if (pageId) {
-                    const pageBlock = blocks.get(pageId);
-                    const docTitle = asText(pageBlock?.get("prop:title"));
-                    if (docTitle) {
-                        const titlePattern = new RegExp(`^#\\s+${docTitle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\n+`);
-                        md = md.replace(titlePattern, "");
-                    }
-                }
-            }
-            const tempKey = `__temp_${Date.now()}`;
-            const tempChildren = new Y.Array();
-            doc.getMap("__temp").set(tempKey, tempChildren);
-            const mdTokens = mdParser.parse(escapePipes(md), {});
-            markdownToBlocks(mdTokens, noteId, blocks, tempChildren);
-            // Insert new blocks at the replace position
-            const newIds = tempChildren.toArray();
-            doc.getMap("__temp").delete(tempKey);
-            if (newIds.length > 0)
-                noteChildren.insert(replaceStart, newIds);
-            const delta = Y.encodeStateAsUpdate(doc, prevSV);
-            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-                .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-            await touchDocMeta(socket, workspaceId, parsed.docId);
-            return text({ written: true, docId: parsed.docId, blocksCreated: noteChildren.length });
+            return text({ processed: results.length, results });
         }
         finally {
             socket.disconnect();
         }
     };
+    const writeDocEntrySchema = z.object({
+        docId: DocId,
+        markdown: z.string().describe("Markdown content to write into the document body"),
+        dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing."),
+        blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
+        blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
+        blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs."),
+    });
     server.registerTool("write_doc_from_markdown", {
         title: "Write Document from Markdown",
-        description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview.",
+        description: "Replace the entire body (or a subset of blocks) of a document with content parsed from a markdown string. Use blockOffset/blockLimit to replace a range of blocks, or blockIds to replace specific blocks — the rest of the document is preserved. Without these params, replaces the entire body. Supports headings, paragraphs, lists, code blocks, blockquotes, tables, dividers, latex, images, attachments, and linked docs. Use dryRun=true to preview. IMPORTANT: attachment blocks are represented as '📎 filename' lines in markdown — if you omit them from the markdown you pass in, they will be permanently dropped. Always include '📎 filename' lines for any attachments that should be preserved. Accepts single doc (docId+markdown) or batch (docs array).",
         inputSchema: {
             workspaceId: WorkspaceId.optional(),
-            docId: DocId,
-            markdown: z.string().describe("Markdown content to write into the document body"),
+            docId: DocId.optional(),
+            markdown: z.string().optional().describe("Markdown content to write into the document body"),
             dryRun: z.boolean().optional().describe("If true, returns current and new markdown without writing. Use to preview changes."),
             blockOffset: z.number().int().min(0).optional().describe("Replace blocks starting at this index (0-based). Use with blockLimit."),
             blockLimit: z.number().int().min(1).optional().describe("Number of blocks to replace starting from blockOffset."),
             blockIds: z.array(z.string()).optional().describe("Replace only these specific block IDs. The contiguous range from first to last matched block is replaced."),
+            docs: z.array(writeDocEntrySchema).min(1).optional().describe("Array of {docId, markdown, ...options} entries for batch mode."),
         },
     }, writeDocFromMarkdownHandler);
     // ── update_doc_markdown (str_replace style partial update) ────────────
@@ -2120,7 +2192,18 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
     }
     // ── update_block (edit block text/properties in-place) ────────────────
     const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+    const updateBlockEntrySchema = z.object({
+        blockId: z.string().min(1).describe("ID of the block to update"),
+        text: z.string().optional().describe("New plain text content for the block"),
+        properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
+    });
     const updateBlockHandler = async (parsed) => {
+        const isBatch = Array.isArray(parsed.blocks) && parsed.blocks.length > 0;
+        const isSingle = typeof parsed.blockId === 'string' && parsed.blockId.length > 0;
+        if (isBatch && isSingle)
+            throw new Error("Provide blockId (single) or blocks array (batch), not both.");
+        if (!isBatch && !isSingle)
+            throw new Error("Provide blockId (single) or blocks array (batch).");
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -2135,71 +2218,37 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
                 throw new Error(`Document '${parsed.docId}' not found.`);
             Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
             const blocks = doc.getMap("blocks");
-            const block = findBlockById(blocks, parsed.blockId);
-            if (!block)
-                throw new Error(`Block '${parsed.blockId}' not found.`);
-            const flavour = block.get("sys:flavour");
-            if (STRUCTURAL_FLAVOURS.has(flavour))
-                throw new Error(`Cannot update structural block (${flavour}).`);
             const prevSV = Y.encodeStateVector(doc);
-            // Update text in-place (preserves Y.Text identity for CRDT correctness)
-            if (parsed.text !== undefined) {
-                const yText = block.get("prop:text");
-                if (yText instanceof Y.Text) {
-                    yText.delete(0, yText.length);
-                    yText.insert(0, parsed.text);
+            if (isSingle) {
+                // Single-block mode
+                const block = findBlockById(blocks, parsed.blockId);
+                if (!block)
+                    throw new Error(`Block '${parsed.blockId}' not found.`);
+                const flavour = block.get("sys:flavour");
+                if (STRUCTURAL_FLAVOURS.has(flavour))
+                    throw new Error(`Cannot update structural block (${flavour}).`);
+                if (parsed.text !== undefined) {
+                    const yText = block.get("prop:text");
+                    if (yText instanceof Y.Text) {
+                        yText.delete(0, yText.length);
+                        yText.insert(0, parsed.text);
+                    }
+                    else {
+                        block.set("prop:text", makeText(parsed.text));
+                    }
                 }
-                else {
-                    block.set("prop:text", makeText(parsed.text));
+                if (parsed.properties) {
+                    for (const [key, value] of Object.entries(parsed.properties)) {
+                        block.set(key.startsWith("prop:") ? key : `prop:${key}`, value);
+                    }
                 }
+                const delta = Y.encodeStateAsUpdate(doc, prevSV);
+                await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+                    .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+                await touchDocMeta(socket, workspaceId, parsed.docId);
+                return text({ updated: true, blockId: parsed.blockId, flavour });
             }
-            // Update properties
-            if (parsed.properties) {
-                for (const [key, value] of Object.entries(parsed.properties)) {
-                    const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
-                    block.set(propKey, value);
-                }
-            }
-            const delta = Y.encodeStateAsUpdate(doc, prevSV);
-            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-                .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-            await touchDocMeta(socket, workspaceId, parsed.docId);
-            return text({ updated: true, blockId: parsed.blockId, flavour });
-        }
-        finally {
-            socket.disconnect();
-        }
-    };
-    const updateBlockMeta = {
-        title: "Update Block",
-        description: "Edit an existing block's text or properties in-place. Cannot update structural blocks (page, surface, note). For text updates, the Y.Text is modified in-place preserving CRDT identity.",
-        inputSchema: {
-            workspaceId: WorkspaceId.optional(),
-            docId: DocId,
-            blockId: z.string().min(1).describe("ID of the block to update"),
-            text: z.string().optional().describe("New plain text content for the block"),
-            properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
-        },
-    };
-    server.registerTool("update_block", updateBlockMeta, updateBlockHandler);
-    const updateBlocksHandler = async (parsed) => {
-        const workspaceId = parsed.workspaceId || defaults.workspaceId;
-        if (!workspaceId)
-            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-        if (!parsed.blocks || parsed.blocks.length === 0)
-            throw new Error("blocks array is required and must not be empty");
-        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-        try {
-            await joinWorkspace(socket, workspaceId);
-            const doc = new Y.Doc();
-            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-            if (!snapshot.missing)
-                throw new Error(`Document '${parsed.docId}' not found.`);
-            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-            const blocks = doc.getMap("blocks");
-            const prevSV = Y.encodeStateVector(doc);
+            // Batch mode
             const updated = [];
             const skipped = [];
             for (const entry of parsed.blocks) {
@@ -2225,8 +2274,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
                 }
                 if (entry.properties) {
                     for (const [key, value] of Object.entries(entry.properties)) {
-                        const propKey = key.startsWith("prop:") ? key : `prop:${key}`;
-                        block.set(propKey, value);
+                        block.set(key.startsWith("prop:") ? key : `prop:${key}`, value);
                     }
                 }
                 updated.push({ blockId: entry.blockId, flavour });
@@ -2241,23 +2289,27 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             socket.disconnect();
         }
     };
-    const updateBlockEntrySchema = z.object({
-        blockId: z.string().min(1).describe("ID of the block to update"),
-        text: z.string().optional().describe("New plain text content for the block"),
-        properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
-    });
-    const updateBlocksMeta = {
-        title: "Update Multiple Blocks",
-        description: "Update multiple blocks in a single transaction. Much faster than calling update_block multiple times. Skips structural blocks (page, surface, note) and missing blocks.",
+    const updateBlockMeta = {
+        title: "Update Block",
+        description: "Edit an existing block's text or properties in-place. Cannot update structural blocks (page, surface, note). For text updates, the Y.Text is modified in-place preserving CRDT identity. Accepts single block (blockId) or batch (blocks array).",
         inputSchema: {
             workspaceId: WorkspaceId.optional(),
             docId: DocId,
-            blocks: z.array(updateBlockEntrySchema).min(1).describe("Array of block updates. Each entry requires blockId and optionally text and/or properties."),
+            blockId: z.string().min(1).optional().describe("ID of the block to update (single mode)"),
+            text: z.string().optional().describe("New plain text content for the block"),
+            properties: z.record(z.any()).optional().describe("Properties to update, e.g. { type: 'h2', language: 'python', checked: true }"),
+            blocks: z.array(updateBlockEntrySchema).min(1).optional().describe("Array of block updates for batch mode. Each entry requires blockId and optionally text and/or properties."),
         },
     };
-    server.registerTool("update_blocks", updateBlocksMeta, updateBlocksHandler);
-    // ── delete_block (remove block + descendants) ─────────────────────────
+    server.registerTool("update_block", updateBlockMeta, updateBlockHandler);
+    // ── delete_block (single or batch) ──────────────────────────────────
     const deleteBlockHandler = async (parsed) => {
+        const isBatch = Array.isArray(parsed.blockIds) && parsed.blockIds.length > 0;
+        const isSingle = typeof parsed.blockId === 'string' && parsed.blockId.length > 0;
+        if (isBatch && isSingle)
+            throw new Error("Provide blockId (single) or blockIds array (batch), not both.");
+        if (!isBatch && !isSingle)
+            throw new Error("Provide blockId (single) or blockIds array (batch).");
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
@@ -2272,71 +2324,41 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
                 throw new Error(`Document '${parsed.docId}' not found.`);
             Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
             const blocks = doc.getMap("blocks");
-            const block = findBlockById(blocks, parsed.blockId);
-            if (!block)
-                throw new Error(`Block '${parsed.blockId}' not found.`);
-            const flavour = block.get("sys:flavour");
-            if (STRUCTURAL_FLAVOURS.has(flavour))
-                throw new Error(`Cannot delete structural block (${flavour}).`);
-            // Remove from parent's sys:children
-            const parentId = block.get("sys:parent");
-            if (parentId) {
-                const parent = findBlockById(blocks, parentId);
-                if (parent) {
-                    const children = ensureChildrenArray(parent);
-                    const idx = indexOfChild(children, parsed.blockId);
-                    if (idx >= 0)
-                        children.delete(idx, 1);
+            const prevSV = Y.encodeStateVector(doc);
+            if (isSingle) {
+                // Single-block mode
+                const block = findBlockById(blocks, parsed.blockId);
+                if (!block)
+                    throw new Error(`Block '${parsed.blockId}' not found.`);
+                const flavour = block.get("sys:flavour");
+                if (STRUCTURAL_FLAVOURS.has(flavour))
+                    throw new Error(`Cannot delete structural block (${flavour}).`);
+                const parentId = block.get("sys:parent");
+                if (parentId) {
+                    const parent = findBlockById(blocks, parentId);
+                    if (parent) {
+                        const children = ensureChildrenArray(parent);
+                        const idx = indexOfChild(children, parsed.blockId);
+                        if (idx >= 0)
+                            children.delete(idx, 1);
+                    }
                 }
+                removeBlockTree(blocks, parsed.blockId);
+                const delta = Y.encodeStateAsUpdate(doc, prevSV);
+                await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
+                    .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
+                await touchDocMeta(socket, workspaceId, parsed.docId);
+                return text({ deleted: true, blockId: parsed.blockId, flavour });
             }
-            const prevSV = Y.encodeStateVector(doc);
-            removeBlockTree(blocks, parsed.blockId);
-            const delta = Y.encodeStateAsUpdate(doc, prevSV);
-            await pushDocUpdate(socket, workspaceId, parsed.docId, Buffer.from(delta).toString("base64"))
-                .catch(err => { console.error(`pushDocUpdate failed for doc ${parsed.docId}:`, err.message); throw err; });
-            await touchDocMeta(socket, workspaceId, parsed.docId);
-            return text({ deleted: true, blockId: parsed.blockId, flavour });
-        }
-        finally {
-            socket.disconnect();
-        }
-    };
-    const deleteBlockMeta = {
-        title: "Delete Block",
-        description: "Delete a block and all its descendants from a document. Cannot delete structural blocks (page, surface, note).",
-        inputSchema: {
-            workspaceId: WorkspaceId.optional(),
-            docId: DocId,
-            blockId: z.string().min(1).describe("ID of the block to delete"),
-        },
-    };
-    server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler);
-    // ── delete_blocks (bulk delete) ───────────────────────────────────────
-    const deleteBlocksHandler = async (parsed) => {
-        const workspaceId = parsed.workspaceId || defaults.workspaceId;
-        if (!workspaceId)
-            throw new Error("workspaceId is required. Provide it as a parameter or set AFFINE_WORKSPACE_ID in environment.");
-        const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
-        const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
-        const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
-        try {
-            await joinWorkspace(socket, workspaceId);
-            const doc = new Y.Doc();
-            const snapshot = await loadDoc(socket, workspaceId, parsed.docId);
-            if (!snapshot.missing)
-                throw new Error(`Document '${parsed.docId}' not found.`);
-            Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
-            const blocks = doc.getMap("blocks");
+            // Batch mode
             const deleted = [];
-            const prevSV = Y.encodeStateVector(doc);
             for (const blockId of parsed.blockIds) {
                 const block = findBlockById(blocks, blockId);
                 if (!block)
-                    continue; // skip missing blocks
+                    continue;
                 const flavour = block.get("sys:flavour");
                 if (STRUCTURAL_FLAVOURS.has(flavour))
-                    continue; // skip structural blocks
-                // Remove from parent's sys:children
+                    continue;
                 const parentId = block.get("sys:parent");
                 if (parentId) {
                     const parent = findBlockById(blocks, parentId);
@@ -2360,31 +2382,17 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             socket.disconnect();
         }
     };
-    const deleteBlocksMeta = {
-        title: "Delete Multiple Blocks",
-        description: "Delete multiple blocks in a single transaction. Skips structural blocks (page, surface, note) and missing blocks.",
+    const deleteBlockMeta = {
+        title: "Delete Block",
+        description: "Delete a block and all its descendants from a document. Cannot delete structural blocks (page, surface, note). Accepts single block (blockId) or batch (blockIds array). Batch mode skips missing/structural blocks.",
         inputSchema: {
             workspaceId: WorkspaceId.optional(),
             docId: DocId,
-            blockIds: z.array(z.string().min(1)).describe("Array of block IDs to delete"),
+            blockId: z.string().min(1).optional().describe("ID of the block to delete (single mode)"),
+            blockIds: z.array(z.string().min(1)).optional().describe("Array of block IDs to delete (batch mode)"),
         },
     };
-    server.registerTool("delete_blocks", deleteBlocksMeta, deleteBlocksHandler);
-    // ── delete_blocks_csv (bulk delete with CSV input) ───────────────────
-    const deleteBlocksCsvHandler = async (parsed) => {
-        const ids = parsed.blockIds.split(',').map(id => id.trim()).filter(id => id.length > 0);
-        return deleteBlocksHandler({ ...parsed, blockIds: ids });
-    };
-    const deleteBlocksCsvMeta = {
-        title: "Delete Multiple Blocks (CSV)",
-        description: "Delete multiple blocks using comma-separated block IDs. Alternative to delete_blocks for clients that don't support JSON arrays.",
-        inputSchema: {
-            workspaceId: WorkspaceId.optional(),
-            docId: DocId,
-            blockIds: z.string().min(1).describe("Comma-separated block IDs (e.g., 'id1,id2,id3')"),
-        },
-    };
-    server.registerTool("delete_blocks_csv", deleteBlocksCsvMeta, deleteBlocksCsvHandler);
+    server.registerTool("delete_block", deleteBlockMeta, deleteBlockHandler);
     // ── move_block (reorder / reparent a block) ───────────────────────────
     const moveBlockHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
@@ -2633,6 +2641,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
                 insertIdx = prevIdx >= 0 ? prevIdx + 1 : 0;
             }
             // Remove affected blocks from noteChildren and blocks map
+            const attachMeta = collectAttachmentMeta(blocks, affectedBlockIds);
             for (const bid of affectedBlockIds) {
                 const childIdx = indexOfChild(noteChildren, bid);
                 if (childIdx >= 0)
@@ -2650,6 +2659,7 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             // Insert new blocks into real note at insertIdx
             const newBlockIds = childIdsFrom(tempChildren);
             blocks.delete(tempNoteId); // clean up temp block
+            restoreAttachmentMeta(blocks, newBlockIds, attachMeta);
             for (let i = 0; i < newBlockIds.length; i++) {
                 const bid = newBlockIds[i];
                 const block = blocks.get(bid);
@@ -2825,86 +2835,63 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             content: z.string().optional(),
         },
     }, createDocHandler);
-    // APPEND PARAGRAPH
-    const appendParagraphHandler = async (parsed) => {
-        const result = await appendBlockInternal({
-            workspaceId: parsed.workspaceId,
-            docId: parsed.docId,
-            type: "paragraph",
-            text: parsed.text,
-        });
-        return text({ appended: result.appended, paragraphId: result.blockId });
-    };
-    server.registerTool('append_paragraph', {
-        title: 'Append Paragraph',
-        description: 'Append a text paragraph block to a document',
-        inputSchema: {
-            workspaceId: z.string().optional(),
-            docId: z.string(),
-            text: z.string(),
-        },
-    }, appendParagraphHandler);
+    const appendBlockEntrySchema = z.object({
+        type: z.string().min(1).describe("Block type (same types as append_block)"),
+        text: z.string().optional(),
+        url: z.string().optional(),
+        pageId: z.string().optional(),
+        iframeUrl: z.string().optional(),
+        html: z.string().optional(),
+        design: z.string().optional(),
+        reference: z.string().optional(),
+        refFlavour: z.string().optional(),
+        width: z.number().int().min(1).max(10000).optional(),
+        height: z.number().int().min(1).max(10000).optional(),
+        background: z.string().optional(),
+        sourceId: z.string().optional(),
+        name: z.string().optional(),
+        mimeType: z.string().optional(),
+        size: z.number().optional(),
+        embed: z.boolean().optional(),
+        rows: z.number().int().min(1).max(20).optional(),
+        columns: z.number().int().min(1).max(20).optional(),
+        latex: z.string().optional(),
+        level: z.number().int().min(1).max(6).optional(),
+        style: AppendBlockListStyle.optional(),
+        bookmarkStyle: AppendBlockBookmarkStyle.optional(),
+        checked: z.boolean().optional(),
+        language: z.string().optional(),
+        caption: z.string().optional(),
+        strict: z.boolean().optional(),
+        placement: z.object({
+            parentId: z.string().optional(),
+            afterBlockId: z.string().optional(),
+            beforeBlockId: z.string().optional(),
+            index: z.number().int().min(0).optional(),
+        }).optional(),
+    });
     const appendBlockHandler = async (parsed) => {
-        const result = await appendBlockInternal(parsed);
-        return text({
-            appended: result.appended,
-            blockId: result.blockId,
-            flavour: result.flavour,
-            type: result.blockType || null,
-            normalizedType: result.normalizedType,
-            legacyType: result.legacyType,
-        });
-    };
-    server.registerTool("append_block", {
-        title: "Append Block",
-        description: "Append document blocks with canonical types and legacy aliases (supports placement + strict validation).",
-        inputSchema: {
-            workspaceId: WorkspaceId.optional(),
-            docId: DocId,
-            type: z.string().min(1).describe("Block type. Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
-            text: z.string().optional().describe("Block content text"),
-            url: z.string().optional().describe("URL for bookmark/embeds"),
-            pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
-            iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
-            html: z.string().optional().describe("Raw html for embed_html"),
-            design: z.string().optional().describe("Design payload for embed_html"),
-            reference: z.string().optional().describe("Target id for surface_ref"),
-            refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
-            width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note"),
-            height: z.number().int().min(1).max(10000).optional().describe("Height for frame/edgeless_text/note"),
-            background: z.string().optional().describe("Background for frame/note"),
-            sourceId: z.string().optional().describe("Blob source id for image/attachment"),
-            name: z.string().optional().describe("Attachment file name"),
-            mimeType: z.string().optional().describe("Attachment mime type"),
-            size: z.number().optional().describe("Attachment/image file size in bytes"),
-            embed: z.boolean().optional().describe("Attachment embed mode"),
-            rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
-            columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
-            latex: z.string().optional().describe("Latex expression"),
-            level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
-            style: AppendBlockListStyle.optional().describe("List style for type=list"),
-            bookmarkStyle: AppendBlockBookmarkStyle.optional().describe("Bookmark card style"),
-            checked: z.boolean().optional().describe("Todo state when type is todo"),
-            language: z.string().optional().describe("Code language when type is code"),
-            caption: z.string().optional().describe("Code caption when type is code"),
-            strict: z.boolean().optional().describe("Strict validation mode (default true)"),
-            placement: z
-                .object({
-                parentId: z.string().optional(),
-                afterBlockId: z.string().optional(),
-                beforeBlockId: z.string().optional(),
-                index: z.number().int().min(0).optional(),
-            })
-                .optional()
-                .describe("Optional insertion target/position"),
-        },
-    }, appendBlockHandler);
-    const appendBlocksHandler = async (parsed) => {
+        const isBatch = Array.isArray(parsed.blocks) && parsed.blocks.length > 0;
+        const isSingle = typeof parsed.type === 'string' && parsed.type.length > 0;
+        if (isBatch && isSingle)
+            throw new Error("Provide type (single) or blocks array (batch), not both.");
+        if (!isBatch && !isSingle)
+            throw new Error("Provide type (single) or blocks array (batch).");
+        if (isSingle) {
+            const result = await appendBlockInternal(parsed);
+            return text({
+                appended: result.appended,
+                blockId: result.blockId,
+                flavour: result.flavour,
+                type: result.blockType || null,
+                normalizedType: result.normalizedType,
+                legacyType: result.legacyType,
+            });
+        }
+        // Batch mode
         const workspaceId = parsed.workspaceId || defaults.workspaceId;
         if (!workspaceId)
             throw new Error("workspaceId is required");
-        if (!parsed.blocks || parsed.blocks.length === 0)
-            throw new Error("blocks array is required and must not be empty");
         const { endpoint, authHeaders } = getEndpointAndAuthHeaders();
         const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
         const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
@@ -2947,51 +2934,70 @@ Supports pagination with blockOffset/blockLimit, or blockIds to read specific bl
             socket.disconnect();
         }
     };
-    const appendBlockEntrySchema = z.object({
-        type: z.string().min(1).describe("Block type (same types as append_block)"),
-        text: z.string().optional(),
-        url: z.string().optional(),
-        pageId: z.string().optional(),
-        iframeUrl: z.string().optional(),
-        html: z.string().optional(),
-        design: z.string().optional(),
-        reference: z.string().optional(),
-        refFlavour: z.string().optional(),
-        width: z.number().int().min(1).max(10000).optional(),
-        height: z.number().int().min(1).max(10000).optional(),
-        background: z.string().optional(),
-        sourceId: z.string().optional(),
-        name: z.string().optional(),
-        mimeType: z.string().optional(),
-        size: z.number().optional(),
-        embed: z.boolean().optional(),
-        rows: z.number().int().min(1).max(20).optional(),
-        columns: z.number().int().min(1).max(20).optional(),
-        latex: z.string().optional(),
-        level: z.number().int().min(1).max(6).optional(),
-        style: AppendBlockListStyle.optional(),
-        bookmarkStyle: AppendBlockBookmarkStyle.optional(),
-        checked: z.boolean().optional(),
-        language: z.string().optional(),
-        caption: z.string().optional(),
-        strict: z.boolean().optional(),
-        placement: z.object({
-            parentId: z.string().optional(),
-            afterBlockId: z.string().optional(),
-            beforeBlockId: z.string().optional(),
-            index: z.number().int().min(0).optional(),
-        }).optional(),
-    });
-    const appendBlocksMeta = {
-        title: "Append Multiple Blocks",
-        description: "Append multiple blocks to a document in a single transaction. Much faster than calling append_block multiple times. Each block entry accepts the same properties as append_block (type, text, url, etc). Blocks are appended in order.",
+    server.registerTool("append_block", {
+        title: "Append Block",
+        description: "Append document blocks with canonical types and legacy aliases (supports placement + strict validation). Accepts single block (type param) or batch (blocks array).",
         inputSchema: {
             workspaceId: WorkspaceId.optional(),
             docId: DocId,
-            blocks: z.array(appendBlockEntrySchema).min(1).describe("Array of block definitions to append. Each entry has the same shape as append_block params (minus workspaceId/docId)."),
+            type: z.string().min(1).optional().describe("Block type (single mode). Canonical: paragraph|heading|quote|list|code|divider|callout|latex|table|bookmark|image|attachment|embed_youtube|embed_github|embed_figma|embed_loom|embed_html|embed_linked_doc|embed_synced_doc|embed_iframe|database|data_view|surface_ref|frame|edgeless_text|note. Legacy aliases remain supported."),
+            text: z.string().optional().describe("Block content text"),
+            url: z.string().optional().describe("URL for bookmark/embeds"),
+            pageId: z.string().optional().describe("Target page/doc id for linked/synced doc embeds"),
+            iframeUrl: z.string().optional().describe("Override iframe src for embed_iframe"),
+            html: z.string().optional().describe("Raw html for embed_html"),
+            design: z.string().optional().describe("Design payload for embed_html"),
+            reference: z.string().optional().describe("Target id for surface_ref"),
+            refFlavour: z.string().optional().describe("Target flavour for surface_ref (e.g. affine:frame)"),
+            width: z.number().int().min(1).max(10000).optional().describe("Width for frame/edgeless_text/note"),
+            height: z.number().int().min(1).max(10000).optional().describe("Height for frame/edgeless_text/note"),
+            background: z.string().optional().describe("Background for frame/note"),
+            sourceId: z.string().optional().describe("Blob source id for image/attachment"),
+            name: z.string().optional().describe("Attachment file name"),
+            mimeType: z.string().optional().describe("Attachment mime type"),
+            size: z.number().optional().describe("Attachment/image file size in bytes"),
+            embed: z.boolean().optional().describe("Attachment embed mode"),
+            rows: z.number().int().min(1).max(20).optional().describe("Table row count"),
+            columns: z.number().int().min(1).max(20).optional().describe("Table column count"),
+            latex: z.string().optional().describe("Latex expression"),
+            level: z.number().int().min(1).max(6).optional().describe("Heading level for type=heading"),
+            style: AppendBlockListStyle.optional().describe("List style for type=list"),
+            bookmarkStyle: AppendBlockBookmarkStyle.optional().describe("Bookmark card style"),
+            checked: z.boolean().optional().describe("Todo state when type is todo"),
+            language: z.string().optional().describe("Code language when type is code"),
+            caption: z.string().optional().describe("Code caption when type is code"),
+            strict: z.boolean().optional().describe("Strict validation mode (default true)"),
+            placement: z
+                .object({
+                parentId: z.string().optional(),
+                afterBlockId: z.string().optional(),
+                beforeBlockId: z.string().optional(),
+                index: z.number().int().min(0).optional(),
+            })
+                .optional()
+                .describe("Optional insertion target/position"),
+            blocks: z.array(appendBlockEntrySchema).min(1).optional().describe("Array of block definitions for batch mode. Each entry has the same shape as single-mode params (minus workspaceId/docId)."),
         },
+    }, appendBlockHandler);
+    // APPEND PARAGRAPH — thin alias for append_block(type='paragraph')
+    const appendParagraphHandler = async (parsed) => {
+        const result = await appendBlockInternal({
+            workspaceId: parsed.workspaceId,
+            docId: parsed.docId,
+            type: "paragraph",
+            text: parsed.text,
+        });
+        return text({ appended: result.appended, paragraphId: result.blockId });
     };
-    server.registerTool("append_blocks", appendBlocksMeta, appendBlocksHandler);
+    server.registerTool('append_paragraph', {
+        title: 'Append Paragraph',
+        description: 'Append a text paragraph block to a document',
+        inputSchema: {
+            workspaceId: z.string().optional(),
+            docId: z.string(),
+            text: z.string(),
+        },
+    }, appendParagraphHandler);
     // DELETE DOC (single or batch) — moves to trash (soft delete)
     const deleteDocHandler = async (parsed) => {
         const workspaceId = parsed.workspaceId || defaults.workspaceId;

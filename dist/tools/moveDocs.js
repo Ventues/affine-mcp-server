@@ -5,6 +5,15 @@ import * as Y from "yjs";
 import { connectWorkspaceSocket, wsUrlFromGraphQLEndpoint, joinWorkspace, loadDoc, pushDocUpdate } from "../ws.js";
 import { applyMarkdownToNote } from "../util/blocks.js";
 import { withFoldersDoc, readAllEntries, getChildren, insertEntry, generateIndexBetween, generateNodeId, } from "./organize.js";
+const STRUCTURAL_FLAVOURS = new Set(["affine:page", "affine:surface", "affine:note"]);
+export function countContentBlocks(blocks) {
+    let count = 0;
+    blocks.forEach((block) => {
+        if (block instanceof Y.Map && !STRUCTURAL_FLAVOURS.has(block.get("sys:flavour")))
+            count++;
+    });
+    return count;
+}
 export async function readBlobCore(gql, workspaceId, key) {
     const baseUrl = gql.endpoint.replace(/\/graphql$/, '');
     const url = `${baseUrl}/api/workspaces/${workspaceId}/blobs/${key}`;
@@ -101,16 +110,130 @@ async function uploadBlobToWorkspace(gql, workspaceId, content, contentType) {
         throw new Error(result.errors[0].message);
     return result.data?.setBlob;
 }
+/** Add a doc link to a folder via Yjs WebSocket (replaces dead addDocToFolder GraphQL mutation). */
+async function addDocToFolderViaWs(gql, workspaceId, docId, folderId) {
+    await withFoldersDoc(gql, workspaceId, (doc) => {
+        const siblings = getChildren(doc, folderId);
+        const existing = siblings.find(s => s.type === "doc" && s.data === docId);
+        if (existing)
+            return;
+        const lastIndex = siblings.length > 0 ? siblings[siblings.length - 1].index : null;
+        const index = generateIndexBetween(lastIndex, null);
+        insertEntry(doc, { id: generateNodeId(), parentId: folderId, type: "doc", data: docId, index });
+    });
+}
+/** Create a new doc via Yjs WebSocket (replaces dead createDoc GraphQL mutation). */
+async function createDocViaWs(gql, workspaceId, title) {
+    const { endpoint, authHeaders } = { endpoint: gql.endpoint, authHeaders: gql.getAuthHeaders() };
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+        await joinWorkspace(socket, workspaceId);
+        const docId = generateNodeId() + generateNodeId(); // ~42-char ID
+        const ydoc = new Y.Doc();
+        const blocks = ydoc.getMap("blocks");
+        const pageId = generateNodeId();
+        const page = new Y.Map();
+        page.set("sys:id", pageId);
+        page.set("sys:flavour", "affine:page");
+        const titleText = new Y.Text();
+        titleText.insert(0, title);
+        page.set("prop:title", titleText);
+        const pageChildren = new Y.Array();
+        page.set("sys:children", pageChildren);
+        blocks.set(pageId, page);
+        const surfaceId = generateNodeId();
+        const surface = new Y.Map();
+        surface.set("sys:id", surfaceId);
+        surface.set("sys:flavour", "affine:surface");
+        surface.set("sys:parent", pageId);
+        surface.set("sys:children", new Y.Array());
+        const elements = new Y.Map();
+        elements.set("type", "$blocksuite:internal:native$");
+        elements.set("value", new Y.Map());
+        surface.set("prop:elements", elements);
+        blocks.set(surfaceId, surface);
+        pageChildren.push([surfaceId]);
+        const noteId = generateNodeId();
+        const note = new Y.Map();
+        note.set("sys:id", noteId);
+        note.set("sys:flavour", "affine:note");
+        note.set("sys:parent", pageId);
+        note.set("sys:children", new Y.Array());
+        note.set("prop:displayMode", "both");
+        note.set("prop:xywh", "[0,0,800,95]");
+        note.set("prop:index", "a0");
+        note.set("prop:hidden", false);
+        const bg = new Y.Map();
+        bg.set("light", "#ffffff");
+        bg.set("dark", "#252525");
+        note.set("prop:background", bg);
+        blocks.set(noteId, note);
+        pageChildren.push([noteId]);
+        const meta = ydoc.getMap("meta");
+        meta.set("id", docId);
+        meta.set("title", title);
+        meta.set("createDate", Date.now());
+        meta.set("tags", new Y.Array());
+        await pushDocUpdate(socket, workspaceId, docId, Buffer.from(Y.encodeStateAsUpdate(ydoc)).toString("base64"));
+        // Register in workspace root pages list
+        const wsDoc = new Y.Doc();
+        const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+        if (snapshot.missing)
+            Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+        const prevSV = Y.encodeStateVector(wsDoc);
+        const wsMeta = wsDoc.getMap("meta");
+        let pages = wsMeta.get("pages");
+        if (!pages) {
+            pages = new Y.Array();
+            wsMeta.set("pages", pages);
+        }
+        const entry = new Y.Map();
+        entry.set("id", docId);
+        entry.set("title", title);
+        entry.set("createDate", Date.now());
+        entry.set("updatedDate", Date.now());
+        entry.set("tags", new Y.Array());
+        pages.push([entry]);
+        await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(Y.encodeStateAsUpdate(wsDoc, prevSV)).toString("base64"));
+        return docId;
+    }
+    finally {
+        socket.disconnect();
+    }
+}
+/** Trash a doc via Yjs WebSocket (replaces dead deleteDoc GraphQL mutation). */
+async function deleteDocViaWs(gql, workspaceId, docId) {
+    const { endpoint, authHeaders } = { endpoint: gql.endpoint, authHeaders: gql.getAuthHeaders() };
+    const wsUrl = wsUrlFromGraphQLEndpoint(endpoint);
+    const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
+    try {
+        await joinWorkspace(socket, workspaceId);
+        const wsDoc = new Y.Doc();
+        const snapshot = await loadDoc(socket, workspaceId, workspaceId);
+        if (snapshot.missing)
+            Y.applyUpdate(wsDoc, Buffer.from(snapshot.missing, "base64"));
+        const prevSV = Y.encodeStateVector(wsDoc);
+        const pages = wsDoc.getMap("meta").get("pages");
+        if (pages) {
+            pages.forEach((m) => {
+                if (m.get && m.get("id") === docId) {
+                    m.set("trash", true);
+                    m.set("trashDate", Date.now());
+                }
+            });
+        }
+        await pushDocUpdate(socket, workspaceId, workspaceId, Buffer.from(Y.encodeStateAsUpdate(wsDoc, prevSV)).toString("base64"));
+    }
+    finally {
+        socket.disconnect();
+    }
+}
 export function registerMoveDocsTools(server, gql, defaults) {
     const moveDocsHandler = async (parsed) => {
         const { docIds, targetFolderId, targetWorkspaceId, sourceWorkspaceId, removeFromSource = true, onBlobError = "abort", preserveFolderStructure = false } = parsed;
         const isSameWorkspace = !sourceWorkspaceId || sourceWorkspaceId === targetWorkspaceId;
         if (isSameWorkspace) {
-            // Delegate to existing organize tools via GraphQL
-            // Use the folder doc manipulation directly
-            const addDocMutation = `mutation AddDocToFolder($workspaceId: String!, $docId: String!, $folderId: String!) {
-        addDocToFolder(workspaceId: $workspaceId, docId: $docId, folderId: $folderId)
-      }`;
             const results = [];
             // Read source folder entries once if preserving structure
             let sourceEntries = [];
@@ -122,13 +245,11 @@ export function registerMoveDocsTools(server, gql, defaults) {
                     const folderId = preserveFolderStructure
                         ? await ensureFolderPath(gql, targetWorkspaceId, targetFolderId, getFolderPathForDoc(sourceEntries, docId))
                         : targetFolderId;
-                    // For same-workspace, we just move the folder link
-                    // Import and call moveNodeHandler would be circular, so use the organize doc approach
-                    await gql.request(addDocMutation, { workspaceId: targetWorkspaceId, docId, folderId });
-                    results.push({ docId, status: "success", blobsTransferred: 0, blobsFailed: 0 });
+                    await addDocToFolderViaWs(gql, targetWorkspaceId, docId, folderId);
+                    results.push({ docId, status: "success", blobsTransferred: 0, blobsFailed: 0, contentIntact: true });
                 }
                 catch (err) {
-                    results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
+                    results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, contentIntact: false, error: err.message });
                 }
             }
             return text(results);
@@ -161,7 +282,7 @@ export function registerMoveDocsTools(server, gql, defaults) {
                     }
                     catch (err) {
                         if (onBlobError === "abort") {
-                            results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
+                            results.push({ docId, status: "error", blobsTransferred: sourceIdMap.size, blobsFailed: sourceIds.size - sourceIdMap.size, contentIntact: false, error: `Blob transfer failed for ${oldKey}: ${err.message}` });
                             aborted = true;
                             break;
                         }
@@ -180,6 +301,7 @@ export function registerMoveDocsTools(server, gql, defaults) {
                 const socket = await connectWorkspaceSocket(wsUrl, authHeaders);
                 let markdown = "";
                 let title = "";
+                let sourceBlockCount = 0;
                 try {
                     await joinWorkspace(socket, sourceWorkspaceId);
                     const snapshot = await loadDoc(socket, sourceWorkspaceId, docId);
@@ -187,6 +309,7 @@ export function registerMoveDocsTools(server, gql, defaults) {
                         const doc = new Y.Doc();
                         Y.applyUpdate(doc, Buffer.from(snapshot.missing, "base64"));
                         const blocks = doc.getMap("blocks");
+                        sourceBlockCount = countContentBlocks(blocks);
                         // Extract title from page block
                         blocks.forEach((block) => {
                             if (!(block instanceof Y.Map))
@@ -203,15 +326,10 @@ export function registerMoveDocsTools(server, gql, defaults) {
                 finally {
                     socket.disconnect();
                 }
-                // 4. Create doc in target workspace
-                const createMutation = `mutation CreateDoc($workspaceId: String!, $title: String) {
-          createDoc(workspaceId: $workspaceId, title: $title) { id }
-        }`;
-                const createResult = await gql.request(createMutation, {
-                    workspaceId: targetWorkspaceId, title: title || "Untitled"
-                });
-                const newDocId = createResult.createDoc.id;
+                // 4. Create doc in target workspace via WebSocket
+                const newDocId = await createDocViaWs(gql, targetWorkspaceId, title || "Untitled");
                 // 5. Write markdown content to new doc via WebSocket
+                let destBlockCount = 0;
                 if (markdown) {
                     const socket2 = await connectWorkspaceSocket(wsUrl, authHeaders);
                     try {
@@ -226,6 +344,7 @@ export function registerMoveDocsTools(server, gql, defaults) {
                                 const noteBlock = blocks.get(noteId);
                                 const noteChildren = noteBlock.get("sys:children");
                                 applyMarkdownToNote(markdown, noteId, blocks, noteChildren);
+                                destBlockCount = countContentBlocks(blocks);
                                 const update = Y.encodeStateAsUpdate(doc);
                                 await pushDocUpdate(socket2, targetWorkspaceId, newDocId, Buffer.from(update).toString("base64"));
                             }
@@ -235,32 +354,27 @@ export function registerMoveDocsTools(server, gql, defaults) {
                         socket2.disconnect();
                     }
                 }
-                // 6. Add to target folder (best-effort via GraphQL)
+                // 6. Add to target folder via WebSocket
                 try {
-                    const addMutation = `mutation AddDocToFolder($workspaceId: String!, $docId: String!, $folderId: String!) {
-            addDocToFolder(workspaceId: $workspaceId, docId: $docId, folderId: $folderId)
-          }`;
                     const destFolderId = preserveFolderStructure
                         ? await ensureFolderPath(gql, targetWorkspaceId, targetFolderId, getFolderPathForDoc(sourceEntries, docId))
                         : targetFolderId;
-                    await gql.request(addMutation, { workspaceId: targetWorkspaceId, docId: newDocId, folderId: destFolderId });
+                    await addDocToFolderViaWs(gql, targetWorkspaceId, newDocId, destFolderId);
                 }
                 catch { }
-                // 7. Remove from source
+                // 7. Remove from source via WebSocket
                 if (removeFromSource) {
                     try {
-                        const deleteMutation = `mutation DeleteDoc($workspaceId: String!, $docId: String!) {
-              deleteDoc(workspaceId: $workspaceId, docId: $docId)
-            }`;
-                        await gql.request(deleteMutation, { workspaceId: sourceWorkspaceId, docId });
+                        await deleteDocViaWs(gql, sourceWorkspaceId, docId);
                     }
                     catch { }
                 }
                 const status = blobsFailed > 0 ? "partial" : "success";
-                results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed });
+                const contentIntact = sourceBlockCount === 0 || sourceBlockCount === destBlockCount;
+                results.push({ docId, status, newDocId, blobsTransferred: sourceIdMap.size, blobsFailed, contentIntact });
             }
             catch (err) {
-                results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, error: err.message });
+                results.push({ docId, status: "error", blobsTransferred: 0, blobsFailed: 0, contentIntact: false, error: err.message });
             }
         }
         return text(results);
